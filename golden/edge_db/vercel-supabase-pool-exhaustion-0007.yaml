@@ -1,0 +1,64 @@
+# Edge/serverless + managed DB: a deploy regression exhausts a connection pool.
+id: gold_0007
+version: 3
+archetype: edge_db
+incident_id: inc_gold_0007
+title: "Deploy abc123 introduced N+1 → Supabase pool exhaustion"
+stack:
+  providers: [vercel, sentry, supabase]
+  integration_mode: agentless
+labels: [pool_exhaustion, n_plus_one, deploy_correlated]
+provenance:
+  source: synthetic
+  captured_at: "2026-05-02T14:11:00Z"
+findings:
+  - role: change_deploy
+    status: ok
+    summary: >-
+      Vercel deploy abc123 at 14:05 immediately precedes the error cliff; the diff adds an
+      unbatched query inside the orders loop (classic N+1).
+    suspected_cause: "deploy abc123 introduced an N+1 query that exhausts the Supabase pool"
+    self_confidence: 0.86
+    signals: ["release.abc123", "deployment.promoted"]
+    evidence:
+      - kind: deploy
+        summary: "Vercel deployment abc123 promoted to production at 14:05Z"
+        observed_at: "2026-05-02T14:05:00Z"
+        raw_ref: "obj://redacted/dep_abc123"
+  - role: metric
+    status: ok
+    summary: "Supabase active connections saturate at pool max (60/60) from 14:06; checkout wait p95 > 5s."
+    suspected_cause: "connection pool exhausted"
+    self_confidence: 0.78
+    signals: ["db.pool.active=60", "db.pool.wait_p95>5s"]
+    evidence:
+      - kind: metric
+        summary: "pg pool active 12→60 within 90s of the deploy"
+        observed_at: "2026-05-02T14:06:30Z"
+        raw_ref: "obj://redacted/met_pool_0007"
+  - role: trace
+    status: ok
+    summary: "Per-request span count for GET /orders jumps 1→43 post-deploy; each span a separate SELECT."
+    suspected_cause: "N+1 query pattern on orders.items"
+    self_confidence: 0.71
+    signals: ["span.db.count=43"]
+    evidence:
+      - kind: trace
+        summary: "trace shows 43 sequential SELECTs on orders.items per request"
+        observed_at: "2026-05-02T14:07:10Z"
+        raw_ref: "obj://redacted/trc_orders_0007"
+expected:
+  root_cause_class: "deploy_regression.db_pool_exhaustion"
+  primary_service_kind: "db"
+  smoking_gun_signal: change_deploy
+  required_supporting_roles: [change_deploy, metric, trace]
+  expected_band: HIGH
+  correct_remediation:
+    action_type: "deploy.rollback"
+    reversible: true
+    acceptable_alternatives: ["service.scale"]
+  expected_outcome_by_grant:
+    T0: page_with_drafted_fix
+    T1: page_with_drafted_fix
+    T2: page_one_tap
+    T3: act_and_report

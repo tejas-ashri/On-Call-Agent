@@ -1,0 +1,48 @@
+[project]
+name = "sentinel"
+version = "0.0.1"
+description = "Agentic on-call SRE as a service — core domain contracts and escalation engine"
+requires-python = ">=3.12"
+dependencies = ["pydantic>=2,<3"]
+
+[project.optional-dependencies]
+# The durable incident runtime (src/sentinel/graph) runs on LangGraph; the rest
+# of the core is dependency-free beyond Pydantic, so it stays an optional extra.
+graph = ["langgraph>=1,<2"]
+# Real Claude-backed agents (opt-in; the core runs offline on fakes without this).
+llm = ["anthropic>=0.40,<1"]
+# The durable data layer (src/sentinel/data): Postgres + RLS via SQLAlchemy async.
+db = ["sqlalchemy[asyncio]>=2,<3", "asyncpg>=0.29"]
+# The eval harness (src/sentinel/eval): the golden incident library is YAML.
+eval = ["pyyaml>=6"]
+dev = [
+    "pytest>=8", "ruff>=0.6", "mypy>=1.10", "langgraph>=1,<2", "anthropic>=0.40,<1",
+    "sqlalchemy[asyncio]>=2,<3", "asyncpg>=0.29", "pyyaml>=6", "types-PyYAML",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["sentinel"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+files = ["src", "tests"]
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+# asyncpg ships no py.typed marker; the data layer wraps it behind typed functions.
+module = "asyncpg.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

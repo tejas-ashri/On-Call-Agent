@@ -1,0 +1,47 @@
+# Uptime-led / thin telemetry: the deliberately HARD stratum — scarce corroboration must
+# land LOW, never a miscalibrated HIGH (§2.1). LOW band pages a human at every tier.
+id: gold_0023
+version: 1
+archetype: uptime_led
+incident_id: inc_gold_0023
+title: "BetterStack flap on marketing site — thin corroboration"
+stack:
+  providers: [betterstack, cloudflare]
+  integration_mode: agentless
+labels: [uptime_flap, thin_signal]
+provenance:
+  source: synthetic
+  captured_at: "2026-05-15T19:02:00Z"
+findings:
+  - role: log
+    status: ok
+    summary: >-
+      A single edge log shows sporadic 522s to origin around the flap, but volume is too low
+      to distinguish a real outage from a probe-side network blip.
+    suspected_cause: "possible origin reachability blip (unconfirmed)"
+    self_confidence: 0.34
+    signals: ["http.522.sporadic"]
+    evidence:
+      - kind: log
+        summary: "3 isolated 522 responses over 4 minutes; no error spike"
+        observed_at: "2026-05-15T19:01:30Z"
+        raw_ref: "obj://redacted/log_522_0023"
+  - role: metric
+    status: no_signal
+    summary: "No corroborating metric anomaly; request volume and latency remain within normal bands."
+    self_confidence: 0.10
+expected:
+  root_cause_class: "uptime_flap.indeterminate"
+  primary_service_kind: "edge"
+  smoking_gun_signal: log
+  required_supporting_roles: []
+  expected_band: LOW
+  correct_remediation:
+    action_type: "service.pause"
+    reversible: true
+    acceptable_alternatives: []
+  expected_outcome_by_grant:
+    T0: page_low_confidence
+    T1: page_low_confidence
+    T2: page_low_confidence
+    T3: page_low_confidence

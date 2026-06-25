@@ -1,0 +1,54 @@
+# Static/JAMstack + functions: a config push (not a code deploy) overblocks at the edge.
+# HIGH + reversible (revert the rule) → full tier ladder, autonomous at T3.
+id: gold_0042
+version: 1
+archetype: jamstack
+incident_id: inc_gold_0042
+title: "Cloudflare WAF rule push blocked /api routes site-wide"
+stack:
+  providers: [cloudflare, sentry]
+  integration_mode: agentless
+labels: [waf_misconfig, config_push, deploy_correlated]
+provenance:
+  source: synthetic
+  captured_at: "2026-05-28T11:20:00Z"
+findings:
+  - role: change_deploy
+    status: ok
+    summary: >-
+      Cloudflare config change at 11:15 added a WAF managed-rule whose pattern matches all
+      /api/* requests; the change author and ruleset id are captured.
+    suspected_cause: "WAF rule push at 11:15 blocks /api/* with HTTP 403"
+    self_confidence: 0.83
+    signals: ["cf.config.change", "waf.rule.added"]
+    evidence:
+      - kind: deploy
+        summary: "Cloudflare ruleset update event at 11:15Z"
+        observed_at: "2026-05-28T11:15:00Z"
+        raw_ref: "obj://redacted/cfg_waf_0042"
+  - role: log
+    status: ok
+    summary: "Edge logs show 403 (WAF) on 100% of /api/* from 11:15; static asset routes are unaffected."
+    suspected_cause: "WAF 403 on /api/*"
+    self_confidence: 0.74
+    signals: ["http.403.waf./api"]
+    evidence:
+      - kind: log
+        summary: "/api/* 403 rate 0→100% at 11:15, ruleId present in WAF log"
+        observed_at: "2026-05-28T11:16:00Z"
+        raw_ref: "obj://redacted/log_waf_0042"
+expected:
+  root_cause_class: "config_change.waf_overblock"
+  primary_service_kind: "edge"
+  smoking_gun_signal: change_deploy
+  required_supporting_roles: [change_deploy, log]
+  expected_band: HIGH
+  correct_remediation:
+    action_type: "config.set_env"
+    reversible: true
+    acceptable_alternatives: ["deploy.rollback"]
+  expected_outcome_by_grant:
+    T0: page_with_drafted_fix
+    T1: page_with_drafted_fix
+    T2: page_one_tap
+    T3: act_and_report

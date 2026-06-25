@@ -1,0 +1,53 @@
+# Container PaaS + Postgres: poll-only signals (Fly has no deploy webhook), MEDIUM band.
+id: gold_0011
+version: 1
+archetype: container_pg
+incident_id: inc_gold_0011
+title: "Fly machine OOM-kill loop on worker after memory creep"
+stack:
+  providers: [fly, postgres, betterstack]
+  integration_mode: agentless
+labels: [oom, restart_loop, poll_only]
+provenance:
+  source: synthetic
+  captured_at: "2026-05-09T02:30:00Z"
+findings:
+  - role: metric
+    status: ok
+    summary: >-
+      Polled Fly metrics show worker RSS climbing to the 512MB cap, then OOM-kill and restart
+      every ~6 minutes; there is no deploy in the window (Fly emits no deploy webhook).
+    suspected_cause: "memory leak in worker driving an OOM-kill / restart loop"
+    self_confidence: 0.61
+    signals: ["mem.rss->512MB", "machine.restart.count=7/h"]
+    evidence:
+      - kind: metric
+        summary: "RSS sawtooth to the 512MB cap; 7 restarts/hour"
+        observed_at: "2026-05-09T02:24:00Z"
+        raw_ref: "obj://redacted/met_rss_0011"
+  - role: log
+    status: ok
+    summary: "Log signature 'Out of memory: Killed process' + 'signal: killed' recurs at each restart boundary."
+    suspected_cause: "OOM kill confirmed in kernel logs"
+    self_confidence: 0.58
+    signals: ["oom_killer", "signal:killed"]
+    evidence:
+      - kind: log
+        summary: "kernel OOM-killer entry precedes each machine restart"
+        observed_at: "2026-05-09T02:25:10Z"
+        raw_ref: "obj://redacted/log_oom_0011"
+expected:
+  root_cause_class: "resource_exhaustion.oom_restart_loop"
+  primary_service_kind: "worker"
+  smoking_gun_signal: metric
+  required_supporting_roles: [metric, log]
+  expected_band: MEDIUM
+  correct_remediation:
+    action_type: "process.restart"
+    reversible: true
+    acceptable_alternatives: ["service.scale"]
+  expected_outcome_by_grant:
+    T0: page_with_drafted_fix
+    T1: page_with_drafted_fix
+    T2: page_one_tap
+    T3: page_one_tap
