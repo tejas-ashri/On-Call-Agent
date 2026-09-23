@@ -2,11 +2,6 @@
 
 > **Agentic on-call SRE as a service for solo founders and tiny teams that ingests telemetry, diagnoses root causes, and drafts autonomous fixes.**
 
-![Python 3.12+](https://img.shields.io/badge/Python-3.12+-blue.svg)
-![PostgreSQL 16](https://img.shields.io/badge/PostgreSQL-16-blue.svg)
-![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-orange.svg)
-![Strict Typing](https://img.shields.io/badge/mypy--strict-passed-success.svg)
-
 ### Why this project?
 For a solo founder or a small 2–4 person startup, there is no "on-call rotation"—when production breaks at 3 a.m., the founder is the rotation. Existing observability tools (PagerDuty, Datadog, Sentry) excel at raising alarms, but leave the actual triage to a sleep-deprived human. Sentinel reverses this model: it sells the *outcome*. By the time the founder is paged, Sentinel has already correlated the telemetry, diagnosed the issue, and drafted a remediation pull request or infrastructure command. You sleep; Sentinel triages.
 
