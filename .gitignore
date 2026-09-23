@@ -21,3 +21,8 @@ venv/
 
 # OS
 .DS_Store
+
+docs/
+read.md
+README2.md
+README.md

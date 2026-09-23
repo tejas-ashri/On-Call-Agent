@@ -14,7 +14,7 @@ how true that is and fits the map that makes it true:
 Deliberately stdlib-only (the doc sketches it in numpy/scipy; we port it to plain ``math``
 to match :mod:`sentinel.confidence` and keep the core dependency-light). The minimizer is a
 golden-section search — NLL of a temperature map is unimodal on the bounded interval.
-"""
+""" 
 
 from __future__ import annotations
 
