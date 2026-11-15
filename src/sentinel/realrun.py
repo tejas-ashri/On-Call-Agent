@@ -1,17 +1,22 @@
 """Run ONE incident through REAL Claude (opt-in — spends ~cents). Reports tokens + cost.
 
-    PYTHONPATH=src ./.venv/bin/python -m sentinel.realrun
+    PYTHONPATH=src ./.venv/bin/python -m sentinel.realrun [--tools]
 
 Requires ``ANTHROPIC_API_KEY`` in ``.env`` and ``SENTINEL_USE_LLM=1`` (else it
 prints how to configure and exits without calling anything). Uses 3 specialists +
 the commander on the cheapest model to keep the spend to a couple of cents, and a
 T1 ("suggest") grant so it never touches prod — it pages with Claude's diagnosis
 and a drafted fix.
+
+With ``--tools`` the specialists investigate with their read-only tools against
+the matching golden scenario (``gold_0007``, the same deploy/pool-exhaustion
+story) instead of answering from the alert text alone — a few more calls.
 """
 
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import Callable
 from typing import cast
 
@@ -38,12 +43,15 @@ from sentinel.edge import (
 from sentinel.enums import AutonomyTier, IncidentState
 from sentinel.graph import build_incident_graph
 from sentinel.notify import render_page
+from sentinel.tools import GoldenTelemetry
 
 # 3 specialists keeps the real run to ~5 cheap calls.
 _ROLES: tuple[SpecialistRole, ...] = ("change_deploy", "metric", "log")
 
 
-async def run_real_incident(*, sink: Callable[[str], None] = print) -> dict[str, object]:
+async def run_real_incident(
+    *, sink: Callable[[str], None] = print, use_tools: bool = False
+) -> dict[str, object]:
     settings = load_settings()
     if not settings.llm_ready:
         sink("LLM not configured — add ANTHROPIC_API_KEY to .env and set SENTINEL_USE_LLM=1.")
@@ -54,7 +62,15 @@ async def run_real_incident(*, sink: Callable[[str], None] = print) -> dict[str,
     sink("=" * 64)
 
     meter = TokenMeter(sink=sink)
-    specialists, commander = build_llm_agents(settings=settings, meter=meter, roles=_ROLES)
+    telemetry = None
+    if use_tools:
+        from sentinel.eval.golden import load_golden  # needs the `eval` extra (pyyaml)
+
+        case = next(c for c in load_golden() if c.id == "gold_0007")
+        telemetry = GoldenTelemetry.from_case(case)
+    specialists, commander = build_llm_agents(
+        settings=settings, meter=meter, roles=_ROLES, telemetry=telemetry
+    )
     planner = _Planner(_plan())
 
     # Ingest a real-shaped incident; the edge redacts before the model sees anything.
@@ -92,6 +108,8 @@ async def run_real_incident(*, sink: Callable[[str], None] = print) -> dict[str,
     sink("── Claude's investigation ────────────────────────────")
     for finding in findings:
         sink(f"  • {finding.role}: {finding.summary}")
+        if finding.tool_calls:
+            sink(f"      tools: {', '.join(finding.tool_calls)}; evidence: {len(finding.evidence)}")
     sink("")
     sink(f"  commander synthesized: {hypotheses[0].statement}")
     sink(
@@ -117,7 +135,7 @@ async def run_real_incident(*, sink: Callable[[str], None] = print) -> dict[str,
 
 
 def main() -> None:
-    asyncio.run(run_real_incident())
+    asyncio.run(run_real_incident(use_tools="--tools" in sys.argv[1:]))
 
 
 if __name__ == "__main__":

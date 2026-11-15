@@ -24,7 +24,12 @@ from datetime import UTC, datetime
 
 from pydantic import BaseModel, ConfigDict
 
-from sentinel.confidence import Calibrator, blend_raw_likelihood, build_assessment
+from sentinel.confidence import (
+    Calibrator,
+    blend_raw_likelihood,
+    build_assessment,
+    independent_corroboration,
+)
 from sentinel.contracts import (
     AutonomyGrant,
     CanonicalEvent,
@@ -137,7 +142,7 @@ async def run_incident(
     top = hypotheses[0]
 
     # score calibrated confidence (doc 04 §6)
-    corroboration = max(0, len(top.supporting_roles) - len(top.contradicting_roles))
+    corroboration = independent_corroboration(top, findings)
     n_competing = sum(
         1 for h in hypotheses[1:] if h.raw_likelihood >= top.raw_likelihood - competing_margin
     )

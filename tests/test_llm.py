@@ -11,7 +11,7 @@ import asyncio
 from datetime import UTC, datetime
 
 from sentinel.agents.llm import Completer, LLMCommander, LLMSpecialist
-from sentinel.contracts import CanonicalEvent, SpecialistFinding
+from sentinel.contracts import CanonicalEvent, SpecialistFinding, SpecialistRole
 from sentinel.enums import EventKind, Severity
 from sentinel.orchestrator import InvestigationContext
 
@@ -87,19 +87,72 @@ def test_specialist_extracts_json_embedded_in_prose() -> None:
     assert finding.self_confidence == 0.3
 
 
+def _finding_as(role: SpecialistRole, cause: str) -> SpecialistFinding:
+    return SpecialistFinding(
+        incident_id="inc_1", role=role, summary=cause, suspected_cause=cause, self_confidence=0.8
+    )
+
+
 def test_commander_parses_hypothesis() -> None:
     comp = _completer(
-        cmd='{"statement": "deploy abc123 introduced an N+1 exhausting the DB pool", '
-        '"confidence": 0.9}'
+        cmd='{"hypotheses": [{"statement": "deploy abc123 introduced an N+1 exhausting the '
+        'DB pool", "likelihood": 0.9, "stances": {"metric": "supports"}}]}'
     )
     hypotheses = asyncio.run(LLMCommander(complete=comp).synthesize("inc_1", [_finding()]))
     assert len(hypotheses) == 1
     assert "abc123" in hypotheses[0].statement
     assert hypotheses[0].raw_likelihood == 0.9
-    assert hypotheses[0].supporting_roles == ["metric"]  # the finding had a suspected_cause
+    assert hypotheses[0].supporting_roles == ["metric"]
 
 
-def test_commander_clamps_out_of_range_confidence() -> None:
-    comp = _completer(cmd='{"statement": "x", "confidence": 5}')
+def test_commander_naming_a_different_cause_is_not_support() -> None:
+    # Regression: any specialist with *a* suspected_cause used to count as supporting.
+    findings = [
+        _finding_as("change_deploy", "deploy abc123"),
+        _finding_as("metric", "upstream DNS outage"),
+        _finding_as("log", "deploy abc123"),
+    ]
+    comp = _completer(
+        cmd='{"hypotheses": [{"statement": "deploy abc123", "likelihood": 0.8, "stances": '
+        '{"change_deploy": "supports", "metric": "contradicts", "log": "supports"}}]}'
+    )
+    [top] = asyncio.run(LLMCommander(complete=comp).synthesize("inc_1", findings))
+    assert top.supporting_roles == ["change_deploy", "log"]
+    assert top.contradicting_roles == ["metric"]
+
+
+def test_commander_ignores_stances_for_roles_that_did_not_report() -> None:
+    comp = _completer(
+        cmd='{"hypotheses": [{"statement": "x", "likelihood": 0.7, '
+        '"stances": {"metric": "supports", "trace": "supports", "bogus": "supports"}}]}'
+    )
+    [top] = asyncio.run(LLMCommander(complete=comp).synthesize("inc_1", [_finding()]))
+    assert top.supporting_roles == ["metric"]
+
+
+def test_commander_returns_ranked_competing_hypotheses() -> None:
+    comp = _completer(
+        cmd='{"hypotheses": ['
+        '{"statement": "DNS outage", "likelihood": 0.4},'
+        '{"statement": "deploy abc123", "likelihood": 0.7},'
+        '{"statement": "pool misconfig", "likelihood": 0.6},'
+        '{"statement": "dropped: over the cap", "likelihood": 0.99}]}'
+    )
+    hypotheses = asyncio.run(LLMCommander(complete=comp).synthesize("inc_1", [_finding()]))
+    assert [h.statement for h in hypotheses] == ["deploy abc123", "pool misconfig", "DNS outage"]
+    assert [h.hypothesis_id for h in hypotheses] == ["h1", "h2", "h3"]
+
+
+def test_commander_clamps_out_of_range_likelihood() -> None:
+    comp = _completer(cmd='{"hypotheses": [{"statement": "x", "likelihood": 5}]}')
     hypotheses = asyncio.run(LLMCommander(complete=comp).synthesize("inc_1", [_finding()]))
     assert hypotheses[0].raw_likelihood == 1.0
+
+
+def test_commander_unparseable_response_is_unsupported_and_zero_likelihood() -> None:
+    hypotheses = asyncio.run(
+        LLMCommander(complete=_completer(cmd="no json here")).synthesize("inc_1", [_finding()])
+    )
+    assert len(hypotheses) == 1
+    assert hypotheses[0].raw_likelihood == 0.0
+    assert hypotheses[0].supporting_roles == []

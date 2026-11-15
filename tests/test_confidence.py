@@ -7,16 +7,30 @@ Written test-first per the project's TDD mandate. Covers:
   ~identity, and (0, 1) is guarded via epsilon.
 - ``build_assessment`` stamps the band/version and bands a calibrated 0.9 → HIGH,
   0.3 → LOW.
+- ``independent_corroboration`` counts evidence-grounded supporters individually
+  but collapses evidence-free (shared-snapshot) supporters into one signal.
 """
 
 from __future__ import annotations
 
 import math
+from datetime import UTC, datetime
 
 import pytest
 
-from sentinel.confidence import Calibrator, blend_raw_likelihood, build_assessment
-from sentinel.contracts import ConfidenceAssessment
+from sentinel.confidence import (
+    Calibrator,
+    blend_raw_likelihood,
+    build_assessment,
+    independent_corroboration,
+)
+from sentinel.contracts import (
+    ConfidenceAssessment,
+    EvidenceRef,
+    Hypothesis,
+    SpecialistFinding,
+    SpecialistRole,
+)
 from sentinel.enums import (
     BAND_HIGH_THRESHOLD,
     BAND_MEDIUM_THRESHOLD,
@@ -221,3 +235,65 @@ def test_build_assessment_low_band_for_weak_raw() -> None:
     )
     assert assessment.band == ConfidenceBand.LOW
     assert assessment.calibrated_confidence < BAND_MEDIUM_THRESHOLD
+
+
+# --------------------------------------------------------------------------- #
+# independent_corroboration                                                   #
+# --------------------------------------------------------------------------- #
+
+_T = datetime(2026, 6, 17, 3, 14, tzinfo=UTC)
+_ALL_ROLES: list[SpecialistRole] = ["log", "metric", "trace", "change_deploy", "error"]
+
+
+def _f(role: SpecialistRole, *, evidenced: bool) -> SpecialistFinding:
+    evidence = [EvidenceRef(kind="log", summary=f"{role} saw it", observed_at=_T)]
+    return SpecialistFinding(
+        incident_id="inc_1", role=role, summary=role, evidence=evidence if evidenced else []
+    )
+
+
+def _h(
+    supporting: list[SpecialistRole], contradicting: list[SpecialistRole] | None = None
+) -> Hypothesis:
+    return Hypothesis(
+        hypothesis_id="h1",
+        statement="x",
+        supporting_roles=supporting,
+        contradicting_roles=contradicting or [],
+    )
+
+
+def test_evidence_free_agreement_counts_once() -> None:
+    # Five role prompts over one shared snapshot agreeing is one opinion, not five.
+    findings = [_f(r, evidenced=False) for r in _ALL_ROLES]
+    assert independent_corroboration(_h(_ALL_ROLES), findings) == 1
+
+
+def test_evidenced_supporters_each_count() -> None:
+    findings = [_f(r, evidenced=True) for r in _ALL_ROLES]
+    assert independent_corroboration(_h(_ALL_ROLES), findings) == 5
+
+
+def test_mixed_evidenced_and_shared_supporters() -> None:
+    findings = [
+        _f("log", evidenced=True),
+        _f("metric", evidenced=True),
+        _f("trace", evidenced=False),
+        _f("error", evidenced=False),
+    ]
+    assert independent_corroboration(_h(["log", "metric", "trace", "error"]), findings) == 3
+
+
+def test_contradictions_count_at_full_weight_and_floor_at_zero() -> None:
+    findings = [_f(r, evidenced=False) for r in _ALL_ROLES]
+    assert independent_corroboration(_h(["log", "metric"], ["trace"]), findings) == 0
+    assert independent_corroboration(_h([], ["trace", "error"]), findings) == 0
+
+
+def test_correlated_agreement_no_longer_inflates_to_high() -> None:
+    # Regression: a 0.5 self-assessment with 5 evidence-free "supporters" used to blend
+    # to ~0.98 (HIGH → T3-eligible). Discounted, it stays MEDIUM.
+    findings = [_f(r, evidenced=False) for r in _ALL_ROLES]
+    corroboration = independent_corroboration(_h(_ALL_ROLES), findings)
+    assert blend_raw_likelihood(0.5, 5, 0) >= BAND_HIGH_THRESHOLD
+    assert band_for(blend_raw_likelihood(0.5, corroboration, 0)) is ConfidenceBand.MEDIUM

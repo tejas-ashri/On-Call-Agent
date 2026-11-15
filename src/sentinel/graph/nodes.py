@@ -19,7 +19,12 @@ from datetime import datetime
 
 from langgraph.types import interrupt
 
-from sentinel.confidence import Calibrator, blend_raw_likelihood, build_assessment
+from sentinel.confidence import (
+    Calibrator,
+    blend_raw_likelihood,
+    build_assessment,
+    independent_corroboration,
+)
 from sentinel.contracts import AutonomyGrant, Hypothesis, PagePayload, RemediationPlan
 from sentinel.enums import ActionStatus, ActionType, IncidentState
 from sentinel.escalation import PolicyInputs, decide_escalation
@@ -177,7 +182,7 @@ def make_score(deps: _Deps) -> Node:
         em = _Emitter(state, deps.clock)
         hypotheses = state["hypotheses"]
         top = hypotheses[0]
-        corroboration = max(0, len(top.supporting_roles) - len(top.contradicting_roles))
+        corroboration = independent_corroboration(top, state["findings"])
         n_competing = sum(
             1
             for h in hypotheses[1:]

@@ -24,13 +24,46 @@ core (:mod:`sentinel.enums`, :mod:`sentinel.contracts`) and never mutates it.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
-from sentinel.contracts import ConfidenceAssessment
+from sentinel.contracts import ConfidenceAssessment, Hypothesis, SpecialistFinding
 from sentinel.enums import band_for
 
 # Guards ``logit``/``sigmoid`` against the singularities at 0 and 1 (doc 06 §6.3
 # clips probabilities to ``[1e-6, 1 - 1e-6]`` for the same reason).
 _EPSILON = 1e-6
+
+
+def independent_corroboration(
+    hypothesis: Hypothesis, findings: Sequence[SpecialistFinding]
+) -> int:
+    """Count the *independent* corroboration behind ``hypothesis`` (doc 04 §6).
+
+    :func:`blend_raw_likelihood` assumes each corroborating specialist is an
+    independent signal. That only holds when a specialist grounds its view in its
+    own evidence. Specialists that cite no evidence all reasoned over the same
+    shared incident snapshot (typically the same model with a different role
+    prompt), so their agreement is one correlated opinion, not N confirmations::
+
+        independent = |supporting roles that cite their own evidence|
+                    + (1 if any supporting role cites none, else 0)
+        corroboration = max(0, independent - |contradicting roles|)
+
+    Contradictions are deliberately *not* discounted: dissent should cost
+    confidence at full weight, and erring that way can only page more, never act
+    more.
+
+    Args:
+        hypothesis: The leading hypothesis being scored.
+        findings: Every specialist finding the hypothesis was synthesized from.
+
+    Returns:
+        The net independent corroboration count (``≥ 0``).
+    """
+    evidenced = {f.role for f in findings if f.evidence}
+    supporting = set(hypothesis.supporting_roles)
+    independent = len(supporting & evidenced) + (1 if supporting - evidenced else 0)
+    return max(0, independent - len(set(hypothesis.contradicting_roles)))
 
 
 def blend_raw_likelihood(
@@ -65,9 +98,8 @@ def blend_raw_likelihood(
 
     Args:
         self_assessment: The top hypothesis' raw likelihood, in ``[0, 1]``.
-        corroboration_count: Independent supporting specialists (``≥ 0``); this
-            is ``supporting_roles`` net of ``contradicting_roles``, floored at 0
-            by the caller.
+        corroboration_count: Independent supporting specialists (``≥ 0``), as
+            computed by :func:`independent_corroboration`.
         n_competing: Rival hypotheses within the leader's likelihood margin
             (``≥ 0``).
 
