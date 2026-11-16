@@ -25,7 +25,7 @@ and nothing else changes.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
@@ -35,6 +35,7 @@ from langgraph.graph.state import CompiledStateGraph
 from sentinel.confidence import Calibrator
 from sentinel.contracts import AutonomyGrant
 from sentinel.graph.nodes import (
+    AuditSink,
     Node,
     _Deps,
     make_act,
@@ -47,6 +48,7 @@ from sentinel.graph.nodes import (
     make_synthesize,
 )
 from sentinel.graph.state import IncidentGraphState
+from sentinel.notify import Notifier
 from sentinel.orchestrator.protocols import ActionExecutor, Commander, Planner, Specialist
 
 
@@ -92,8 +94,18 @@ def build_incident_graph(
     competing_margin: float = 0.15,
     clock: Callable[[], datetime] = _utcnow,
     checkpointer: BaseCheckpointSaver[str] | None = None,
+    notifier: Notifier | None = None,
+    cost_breaker_open: Callable[[str], bool] | None = None,
+    approval_ttl: timedelta | None = timedelta(hours=1),
+    audit: AuditSink | None = None,
 ) -> CompiledStateGraph[IncidentGraphState]:
-    """Build and compile the durable incident graph wired with the given ports."""
+    """Build and compile the durable incident graph wired with the given ports.
+
+    ``notifier`` delivers every page the graph produces. ``cost_breaker_open``
+    (``tenant_id → open?``) forces T0 while a tenant is over budget (doc 07 §5).
+    An approval arriving more than ``approval_ttl`` after it was requested is
+    treated as a denial. ``audit`` records each decision, approval and action.
+    """
     deps = _Deps(
         commander=commander,
         planner=planner,
@@ -102,6 +114,10 @@ def build_incident_graph(
         calibrator=calibrator,
         competing_margin=competing_margin,
         clock=clock,
+        notifier=notifier,
+        cost_breaker_open=cost_breaker_open,
+        approval_ttl=approval_ttl,
+        audit=audit,
     )
 
     g: StateGraph[IncidentGraphState] = StateGraph(IncidentGraphState)

@@ -42,6 +42,10 @@ class DedupStore(Protocol):
         """Return ``True`` if ``key`` was already seen; otherwise record it and return ``False``."""
         ...
 
+    async def release(self, key: str) -> None:
+        """Forget ``key`` so a provider retry is processed again (Redis ``DEL`` in prod)."""
+        ...
+
 
 class InMemoryDedupStore:
     """An offline :class:`DedupStore` backed by a set (the Redis SETNX in prod)."""
@@ -54,6 +58,9 @@ class InMemoryDedupStore:
             return True
         self._seen.add(key)
         return False
+
+    async def release(self, key: str) -> None:
+        self._seen.discard(key)
 
 
 class IngestionEdge:
@@ -79,18 +86,25 @@ class IngestionEdge:
             raise WebhookRejected(f"{ctx.provider}: webhook signature verification failed")
 
         # 2. dedup — providers retry; the same delivery must normalize at most once (C1)
-        if await self._dedup.check_and_record(idempotency_key(raw, ctx.provider)):
+        key = idempotency_key(raw, ctx.provider)
+        if await self._dedup.check_and_record(key):
             return []
 
-        # 3. normalize — pure provider-native → CanonicalEvent (body_redacted left empty)
-        events = await connector.normalize(raw, ctx)
+        try:
+            # 3. normalize — pure provider-native → CanonicalEvent (body_redacted left empty)
+            events = await connector.normalize(raw, ctx)
 
-        # 4. redact + 5. produce — scrub every persisting field, THEN publish (C2)
-        published: list[CanonicalEvent] = []
-        for event in events:
-            redacted = self._redact_event(event, raw)
-            await self._bus.publish(redacted)
-            published.append(redacted)
+            # 4. redact + 5. produce — scrub every persisting field, THEN publish (C2)
+            published: list[CanonicalEvent] = []
+            for event in events:
+                redacted = self._redact_event(event, raw)
+                await self._bus.publish(redacted)
+                published.append(redacted)
+        except BaseException:
+            # Un-claim the delivery so the provider's retry is processed, not dropped as
+            # a duplicate. A partial publish may then repeat (at-least-once, never lost).
+            await self._dedup.release(key)
+            raise
         return published
 
     def _redact_event(self, event: CanonicalEvent, raw: RawSignal) -> CanonicalEvent:

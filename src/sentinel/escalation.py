@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from sentinel.contracts.agents import EscalationDecision, EscalationOutcome
+from sentinel.contracts.autonomy import AutonomyGrant
 from sentinel.enums import AutonomyTier, ConfidenceBand
 
 _TargetState = Literal["AWAITING_APPROVAL", "REMEDIATING", "ESCALATED"]
@@ -32,6 +33,34 @@ class PolicyInputs:
     max_tier: AutonomyTier  # from the AutonomyGrant for this (tenant × action_type)
     reversible: bool  # from RemediationPlan / ActionRequest
     n_competing: int = 0  # rival hypotheses within margin (for the rationale)
+
+
+def effective_tier(
+    grant: AutonomyGrant,
+    *,
+    tenant_id: str,
+    action_type: str,
+    breaker_open: bool = False,
+) -> AutonomyTier:
+    """The tier ``grant`` actually confers on one ``(tenant, action_type)`` decision.
+
+    A grant is scoped to exactly one tenant and one action type (doc 00 §5.2), so
+    it confers nothing — ``T0`` — when it is revoked, belongs to another tenant,
+    or covers a different action. An open cost breaker also degrades to ``T0``
+    (doc 07 §5, ADR-010). Grant ``constraints`` are not yet evaluated here, so a
+    constrained grant is capped at ``T2``: it may still execute, but only after a
+    human approves (fail safe, C1).
+    """
+    if (
+        breaker_open
+        or not grant.active
+        or grant.tenant_id != tenant_id
+        or grant.action_type != action_type
+    ):
+        return AutonomyTier.T0
+    if grant.constraints and grant.max_tier is AutonomyTier.T3:
+        return AutonomyTier.T2
+    return grant.max_tier
 
 
 def decide_escalation(i: PolicyInputs) -> EscalationDecision:

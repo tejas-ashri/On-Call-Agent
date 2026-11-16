@@ -44,8 +44,16 @@ from sentinel.contracts import (
 from sentinel.contracts.actions import ActionResult
 from sentinel.correlator import IncidentDraft
 from sentinel.enums import ActionStatus, ActionType, IncidentState
-from sentinel.escalation import PolicyInputs, decide_escalation
+from sentinel.escalation import PolicyInputs, decide_escalation, effective_tier
 from sentinel.incidents.events import IncidentEvent, IncidentEventType
+from sentinel.notify import Notifier
+from sentinel.orchestrator.guard import (
+    no_plan_decision,
+    safe_draft,
+    safe_execute,
+    safe_investigate,
+    safe_synthesize,
+)
 from sentinel.orchestrator.protocols import (
     ActionExecutor,
     Commander,
@@ -90,12 +98,15 @@ async def run_incident(
     calibrator: Calibrator,
     competing_margin: float = 0.15,
     clock: Callable[[], datetime] = _utcnow,
+    notifier: Notifier | None = None,
+    cost_breaker_open: Callable[[str], bool] | None = None,
 ) -> IncidentRun:
     """Run one incident end to end and return a fully-recorded :class:`IncidentRun`.
 
     The branch on ``decision.outcome`` is doc 00 §6's escalation matrix: only
     ``act_and_report`` touches prod (via ``executor``); every other outcome pages
-    a human with the drafted fix attached and never acts (C1).
+    a human with the drafted fix attached and never acts (C1). ``notifier``
+    delivers that page; ``cost_breaker_open`` forces T0 for an over-budget tenant.
     """
     incident_id = draft.incident_id
     tenant_id = draft.tenant_id
@@ -127,7 +138,7 @@ async def run_incident(
 
     # fan-out specialists (sequential here for determinism; concurrent in production)
     ctx = InvestigationContext(incident_id=incident_id, tenant_id=tenant_id, events=list(events))
-    findings: list[SpecialistFinding] = [await s.investigate(ctx) for s in specialists]
+    findings: list[SpecialistFinding] = [await safe_investigate(s, ctx) for s in specialists]
     for finding in findings:
         emit(
             IncidentEventType.SPECIALIST_FINDING,
@@ -136,9 +147,7 @@ async def run_incident(
         )
 
     # synthesize
-    hypotheses = await commander.synthesize(incident_id, findings)
-    if not hypotheses:
-        raise ValueError("commander returned no hypotheses to score")
+    hypotheses = await safe_synthesize(commander, incident_id, findings)
     top = hypotheses[0]
 
     # score calibrated confidence (doc 04 §6)
@@ -163,17 +172,26 @@ async def run_incident(
     emit(IncidentEventType.INCIDENT_DIAGNOSED, "commander")
 
     # plan + the independent reversibility floor (doc 05 §6) feeding the policy (doc 04 §7)
-    plan = await planner.draft(incident_id, top)
-    floor_reversible = classify_reversibility(ActionType(plan.action_type), plan.reversible)
-    decision = decide_escalation(
-        PolicyInputs(
-            incident_id=incident_id,
-            band=assessment.band,
-            max_tier=grant.max_tier,
-            reversible=floor_reversible,
-            n_competing=n_competing,
-        )
+    plan = await safe_draft(planner, incident_id, top)
+    tier = effective_tier(
+        grant,
+        tenant_id=tenant_id,
+        action_type=plan.action_type if plan is not None else "",
+        breaker_open=_breaker_open(cost_breaker_open, tenant_id),
     )
+    if plan is None:
+        decision = no_plan_decision(incident_id, assessment, tier)
+    else:
+        floor_reversible = classify_reversibility(ActionType(plan.action_type), plan.reversible)
+        decision = decide_escalation(
+            PolicyInputs(
+                incident_id=incident_id,
+                band=assessment.band,
+                max_tier=tier,
+                reversible=floor_reversible,
+                n_competing=n_competing,
+            )
+        )
 
     evidence_chain: list[EvidenceRef] = [ev for f in findings for ev in f.evidence]
     page_payload: PagePayload | None = None
@@ -181,8 +199,11 @@ async def run_incident(
     final_state: IncidentState
 
     if decision.outcome == "act_and_report":
+        assert plan is not None  # decide_escalation only runs with a plan
         emit(IncidentEventType.REMEDIATION_STARTED, "planner")
-        action_result = await executor.execute(plan, tenant_id=tenant_id, incident_id=incident_id)
+        action_result = await safe_execute(
+            executor, plan, tenant_id=tenant_id, incident_id=incident_id
+        )
         emit(IncidentEventType.MONITORING_STARTED, "commander")
         if action_result.status is ActionStatus.SUCCEEDED and not action_result.rolled_back:
             emit(IncidentEventType.INCIDENT_RESOLVED, "commander")
@@ -207,12 +228,15 @@ async def run_incident(
             emit(IncidentEventType.INCIDENT_ESCALATED, "commander", {"outcome": decision.outcome})
             final_state = IncidentState.ESCALATED
 
+    if page_payload is not None and notifier is not None:
+        await notifier.page(page_payload)
+
     return IncidentRun(
         incident_id=incident_id,
         tenant_id=tenant_id,
         final_state=final_state,
         findings=findings,
-        hypotheses=list(hypotheses),
+        hypotheses=hypotheses,
         events=log,
         assessment=assessment,
         decision=decision,
@@ -222,13 +246,23 @@ async def run_incident(
     )
 
 
+def _breaker_open(probe: Callable[[str], bool] | None, tenant_id: str) -> bool:
+    """Whether the tenant's cost breaker is open; an unreadable breaker counts as open."""
+    if probe is None:
+        return False
+    try:
+        return bool(probe(tenant_id))
+    except Exception:
+        return True
+
+
 def _build_page(
     tenant_id: str,
     top: Hypothesis,
     assessment: ConfidenceAssessment,
     evidence_chain: list[EvidenceRef],
     hypotheses: Sequence[Hypothesis],
-    plan: RemediationPlan,
+    plan: RemediationPlan | None,
     outcome: str,
 ) -> PagePayload:
     """The §00.6 page contract: root cause, evidence chain, rivals, drafted fix."""

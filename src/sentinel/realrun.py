@@ -33,7 +33,17 @@ from sentinel.contracts import (
     SpecialistFinding,
     SpecialistRole,
 )
-from sentinel.demo import _T, _TENANT, _ctx, _Executor, _grant, _plan, _Planner, _sentry_raw
+from sentinel.demo import (
+    _T,
+    _TENANT,
+    _WEBHOOK_SECRET,
+    _ctx,
+    _Executor,
+    _grant,
+    _plan,
+    _Planner,
+    _sentry_raw,
+)
 from sentinel.edge import (
     IngestionEdge,
     InMemoryDedupStore,
@@ -76,7 +86,7 @@ async def run_real_incident(
     # Ingest a real-shaped incident; the edge redacts before the model sees anything.
     bus = InMemoryEventBus()
     edge = IngestionEdge(bus=bus, dedup=InMemoryDedupStore())
-    connector = SentryConnector()
+    connector = SentryConnector(webhook_secret=_WEBHOOK_SECRET)
     for i in range(2):
         await edge.ingest(_sentry_raw(event_id=f"ev_{i}"), _ctx(), connector)
     events = bus.tenant_events(_TENANT)

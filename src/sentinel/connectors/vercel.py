@@ -53,6 +53,8 @@ _TYPE_TO_TITLE: dict[str, str] = {
 class VercelConnector(ConnectorBase):
     """Vercel adapter (doc 03 §6.2). Writes: ``deploy.rollback``/``deploy.redeploy``."""
 
+    signature_header = "x-vercel-signature"  # HMAC-SHA1 of the body (doc 03 §3)
+    signature_digest = "sha1"
     capabilities = ConnectorCapabilities(
         provider="vercel",
         reads=frozenset({EventKind.DEPLOY, EventKind.LOG}),

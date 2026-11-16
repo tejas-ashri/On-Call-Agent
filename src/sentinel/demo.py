@@ -17,6 +17,7 @@ Flip ``SENTINEL_USE_LLM=1`` with a key in ``.env`` to swap the stubs for Claude
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Literal, cast
@@ -24,7 +25,7 @@ from typing import Literal, cast
 from langgraph.graph.state import CompiledStateGraph
 
 from sentinel.confidence import Calibrator
-from sentinel.connectors.base import IntegrationContext, RawSignal
+from sentinel.connectors.base import IntegrationContext, RawSignal, webhook_signature
 from sentinel.connectors.sentry import SentryConnector
 from sentinel.contracts import (
     AutonomyGrant,
@@ -63,6 +64,7 @@ from sentinel.orchestrator import (
 
 _T = datetime(2026, 6, 17, 3, 14, tzinfo=UTC)
 _TENANT = "ten_demo"
+_WEBHOOK_SECRET = "demo-sentry-client-secret"  # the integration's signing secret (demo only)
 _ROOT_CAUSE = "deploy abc123 introduced an N+1 query that exhausted the DB connection pool"
 _ROLES: tuple[SpecialistRole, ...] = ("change_deploy", "metric", "trace", "log", "error")
 
@@ -180,12 +182,15 @@ def _sentry_raw(*, event_id: str) -> RawSignal:
         "timestamp": 1_750_000_000.0,
         "context": {"dsn": "postgresql://app:S3cr3tP@ss@db.internal:5432/prod"},
     }
+    payload: dict[str, object] = {"data": {"event": event}}
+    body = json.dumps(payload).encode()
     return RawSignal(
         integration_id="int_demo",
         method=IntegrationMethod.WEBHOOK,
-        payload={"data": {"event": event}},
-        headers={},
+        payload=payload,
+        headers={"sentry-hook-signature": webhook_signature(_WEBHOOK_SECRET, body)},
         received_at=_T,
+        body=body,
     )
 
 
@@ -248,7 +253,7 @@ async def run_demo(*, sink: Callable[[str], None] = print) -> dict[str, Incident
     # 1. Ingestion edge: authenticate → dedup → redact → normalize → publish.
     bus = InMemoryEventBus()
     edge = IngestionEdge(bus=bus, dedup=InMemoryDedupStore())
-    connector = SentryConnector()
+    connector = SentryConnector(webhook_secret=_WEBHOOK_SECRET)
     for i in range(3):
         await edge.ingest(_sentry_raw(event_id=f"ev_{i}"), _ctx(), connector)
     events = bus.tenant_events(_TENANT)

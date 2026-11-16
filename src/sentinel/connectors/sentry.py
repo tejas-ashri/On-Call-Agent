@@ -38,6 +38,7 @@ _LEVEL_TO_SEVERITY: dict[str, Severity] = {
 class SentryConnector(ConnectorBase):
     """Sentry adapter (doc 03 §6.1). Read-only: ``writes`` is empty."""
 
+    signature_header = "sentry-hook-signature"  # HMAC-SHA256 of the body (doc 03 §3)
     capabilities = ConnectorCapabilities(
         provider="sentry",
         reads=frozenset({EventKind.ERROR, EventKind.ALERT}),

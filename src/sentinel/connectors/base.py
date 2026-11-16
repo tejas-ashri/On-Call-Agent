@@ -17,9 +17,12 @@ copies of these; here they are imported so there is a single source of truth.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import ClassVar, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -104,6 +107,12 @@ class RawSignal(BaseModel):
     payload: dict[str, object]  # provider-native JSON (doc 03 §1.1: ``payload: dict``)
     headers: dict[str, str] = Field(default_factory=dict)
     received_at: datetime
+    body: bytes | None = None  # the exact request bytes the provider signed
+
+
+def webhook_signature(secret: str, body: bytes, digest: str = "sha256") -> str:
+    """Hex HMAC of a webhook body — what providers put in their signature header."""
+    return hmac.new(secret.encode(), body, getattr(hashlib, digest)).hexdigest()
 
 
 class HealthStatus(BaseModel):
@@ -166,6 +175,12 @@ class ConnectorBase(ABC):
     """
 
     capabilities: ConnectorCapabilities
+    #: Header carrying the provider's hex HMAC of the raw body, and its digest.
+    signature_header: ClassVar[str | None] = None
+    signature_digest: ClassVar[str] = "sha256"
+
+    def __init__(self, *, webhook_secret: str | None = None) -> None:
+        self._webhook_secret = webhook_secret
 
     @abstractmethod
     async def normalize(
@@ -173,10 +188,23 @@ class ConnectorBase(ABC):
     ) -> list[CanonicalEvent]: ...
 
     async def verify_webhook(self, raw: RawSignal, ctx: IntegrationContext) -> bool:
-        """Signature verification (doc 03 §3). HMAC keys are brokered JIT, so the
-        infra-free base accepts by default; concrete edges override with the
-        provider HMAC check before this layer is reached."""
-        return True
+        """Signature verification (doc 03 §3). Fails closed.
+
+        Accepts only when a webhook secret is configured, the signature header
+        matches the HMAC of the raw ``body``, and ``payload`` is exactly that body
+        parsed — so a signed body cannot be paired with a forged payload.
+        """
+        if self._webhook_secret is None or self.signature_header is None or raw.body is None:
+            return False
+        headers = {k.lower(): v for k, v in raw.headers.items()}
+        given = headers.get(self.signature_header, "").strip()
+        expected = webhook_signature(self._webhook_secret, raw.body, self.signature_digest)
+        if not given or not hmac.compare_digest(given, expected):
+            return False
+        try:
+            return bool(json.loads(raw.body) == raw.payload)
+        except ValueError:
+            return False
 
     async def healthcheck(self, ctx: IntegrationContext) -> HealthStatus:
         """Default healthy probe (doc 03 §1.1, §4); concrete connectors may refine."""

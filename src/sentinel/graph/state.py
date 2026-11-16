@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import operator
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Annotated, TypedDict
 
 from sentinel.contracts import (
@@ -54,6 +55,7 @@ class IncidentGraphState(TypedDict, total=False):
     page_payload: PagePayload | None
     action_result: ActionResult | None
     approval: bool | None
+    approval_requested_at: datetime | None
     final_state: IncidentState | None
 
 
@@ -75,5 +77,6 @@ def initial_state(
         page_payload=None,
         action_result=None,
         approval=None,
+        approval_requested_at=None,
         final_state=None,
     )

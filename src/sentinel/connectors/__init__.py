@@ -16,6 +16,7 @@ from sentinel.connectors.base import (
     IntegrationContext,
     RawSignal,
     WriteCapability,
+    webhook_signature,
 )
 from sentinel.connectors.idempotency import idempotency_key
 from sentinel.connectors.sentry import SentryConnector
@@ -33,4 +34,5 @@ __all__ = [
     "VercelConnector",
     "WriteCapability",
     "idempotency_key",
+    "webhook_signature",
 ]

@@ -12,13 +12,14 @@ the real redactor, the real correlator, and the real LangGraph runtime.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
 import pytest
 
 from sentinel.confidence import Calibrator
-from sentinel.connectors.base import IntegrationContext, RawSignal
+from sentinel.connectors.base import IntegrationContext, RawSignal, webhook_signature
 from sentinel.connectors.sentry import SentryConnector
 from sentinel.contracts import (
     EvidenceRef,
@@ -48,6 +49,7 @@ from sentinel.graph import build_incident_graph
 from sentinel.orchestrator import Commander, InvestigationContext, Planner, Specialist
 
 _T = datetime(2026, 6, 14, 12, 0, tzinfo=UTC)
+_SECRET = "test-sentry-client-secret"
 
 
 # --------------------------------------------------------------------------- builders
@@ -64,13 +66,20 @@ def _sentry_raw(
         "release": "abc123",
         "timestamp": 1750000000.0,
     }
+    payload: dict[str, object] = {"data": {"event": event}}
+    body = json.dumps(payload).encode()
     return RawSignal(
         integration_id="int_1",
         method=IntegrationMethod.WEBHOOK,
-        payload={"data": {"event": event}},
-        headers={},
+        payload=payload,
+        headers={"sentry-hook-signature": webhook_signature(_SECRET, body)},
         received_at=_T,
+        body=body,
     )
+
+
+def _connector() -> SentryConnector:
+    return SentryConnector(webhook_secret=_SECRET)
 
 
 def _ctx(tenant_id: str = "ten_a") -> IntegrationContext:
@@ -194,7 +203,7 @@ def test_ingest_redacts_secrets_before_publishing() -> None:
     ghp = "ghp_" + "a" * 36
     raw = _sentry_raw(title=f"NullPointer near {aws}", culprit=ghp)
 
-    published = asyncio.run(edge.ingest(raw, _ctx(), SentryConnector()))
+    published = asyncio.run(edge.ingest(raw, _ctx(), _connector()))
 
     assert len(published) == 1
     ev = published[0]
@@ -216,8 +225,8 @@ def test_duplicate_delivery_is_deduped() -> None:
     edge = IngestionEdge(bus=bus, dedup=InMemoryDedupStore())
     raw = _sentry_raw()
 
-    first = asyncio.run(edge.ingest(raw, _ctx(), SentryConnector()))
-    second = asyncio.run(edge.ingest(raw, _ctx(), SentryConnector()))
+    first = asyncio.run(edge.ingest(raw, _ctx(), _connector()))
+    second = asyncio.run(edge.ingest(raw, _ctx(), _connector()))
 
     assert len(first) == 1 and second == []  # retry collapses (doc 03 §3)
     assert len(bus.tenant_events("ten_a")) == 1
@@ -238,7 +247,7 @@ def test_pipeline_collapses_storm_into_one_closed_incident() -> None:
     edge = IngestionEdge(bus=bus, dedup=InMemoryDedupStore())
     # Two deliveries, same Sentry issue (→ same fingerprint → correlate) but distinct
     # delivery ids (→ both ingest, not deduped).
-    conn = SentryConnector()
+    conn = _connector()
     asyncio.run(edge.ingest(_sentry_raw(event_id="ev_a", issue_id="777"), _ctx(), conn))
     asyncio.run(edge.ingest(_sentry_raw(event_id="ev_b", issue_id="777"), _ctx(), conn))
     assert len(bus.tenant_events("ten_a")) == 2
@@ -264,7 +273,7 @@ def test_tenant_keyed_bus_isolates_incidents() -> None:
     bus = InMemoryEventBus()
     edge = IngestionEdge(bus=bus, dedup=InMemoryDedupStore())
     # Same Sentry issue id across two tenants must NEVER share an incident.
-    conn = SentryConnector()
+    conn = _connector()
     asyncio.run(edge.ingest(_sentry_raw(event_id="a", issue_id="777"), _ctx("ten_a"), conn))
     asyncio.run(edge.ingest(_sentry_raw(event_id="b", issue_id="777"), _ctx("ten_b"), conn))
 

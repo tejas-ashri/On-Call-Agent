@@ -13,9 +13,10 @@ stays gap-free — see :mod:`sentinel.graph.state`.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Protocol
 
 from langgraph.types import interrupt
 
@@ -27,9 +28,17 @@ from sentinel.confidence import (
 )
 from sentinel.contracts import AutonomyGrant, Hypothesis, PagePayload, RemediationPlan
 from sentinel.enums import ActionStatus, ActionType, IncidentState
-from sentinel.escalation import PolicyInputs, decide_escalation
+from sentinel.escalation import PolicyInputs, decide_escalation, effective_tier
 from sentinel.graph.state import IncidentGraphState
 from sentinel.incidents.events import IncidentEvent, IncidentEventType
+from sentinel.notify import Notifier
+from sentinel.orchestrator.guard import (
+    no_plan_decision,
+    safe_draft,
+    safe_execute,
+    safe_investigate,
+    safe_synthesize,
+)
 from sentinel.orchestrator.protocols import (
     ActionExecutor,
     Commander,
@@ -52,6 +61,21 @@ _ROLE_ORDER: dict[str, int] = {
 Node = Callable[[IncidentGraphState], Awaitable[dict[str, object]]]
 
 
+class AuditSink(Protocol):
+    """Records who decided what (doc 05 §5); :class:`sentinel.audit.AuditLog` conforms."""
+
+    def append(
+        self,
+        *,
+        tenant_id: str,
+        actor: str,
+        action: str,
+        at: datetime,
+        target: str | None = None,
+        detail: Mapping[str, object] | None = None,
+    ) -> object: ...
+
+
 @dataclass(frozen=True)
 class _Deps:
     """The injected ports the graph runs against (doc 04 §3)."""
@@ -63,6 +87,41 @@ class _Deps:
     calibrator: Calibrator
     competing_margin: float
     clock: Callable[[], datetime]
+    notifier: Notifier | None = None
+    cost_breaker_open: Callable[[str], bool] | None = None
+    approval_ttl: timedelta | None = None
+    audit: AuditSink | None = None
+
+    def breaker_open(self, tenant_id: str) -> bool:
+        """Whether the tenant's cost breaker is open; an unreadable breaker counts as open."""
+        if self.cost_breaker_open is None:
+            return False
+        try:
+            return bool(self.cost_breaker_open(tenant_id))
+        except Exception:
+            return True
+
+    async def notify(self, page: PagePayload) -> None:
+        if self.notifier is not None:
+            await self.notifier.page(page)
+
+    def record(
+        self,
+        state: IncidentGraphState,
+        actor: str,
+        action: str,
+        target: str | None,
+        detail: Mapping[str, object],
+    ) -> None:
+        if self.audit is not None:
+            self.audit.append(
+                tenant_id=state["draft"].tenant_id,
+                actor=actor,
+                action=action,
+                at=self.clock(),
+                target=target,
+                detail={"incident_id": state["draft"].incident_id, **detail},
+            )
 
 
 class _Emitter:
@@ -98,7 +157,7 @@ class _Emitter:
 
 
 def _build_page(
-    state: IncidentGraphState, top: Hypothesis, plan: RemediationPlan, outcome: str
+    state: IncidentGraphState, top: Hypothesis, plan: RemediationPlan | None, outcome: str
 ) -> PagePayload:
     """The doc 00 §6 page contract: root cause, evidence chain, rivals, drafted fix."""
     assessment = state["assessment"]
@@ -116,11 +175,18 @@ def _build_page(
     )
 
 
-def _coerce_approved(payload: object) -> bool:
-    """Interpret the human's resume value from the approval interrupt."""
-    if isinstance(payload, dict):
-        return bool(payload.get("approved"))
-    return bool(payload)
+def _parse_approval(payload: object) -> tuple[bool, str | None]:
+    """Interpret the human's resume value: ``(approved, approver)``.
+
+    Only a literal ``True`` (or ``{"approved": True}``) approves — anything else,
+    including ``"false"``, ``"no"`` or ``1``, is a denial (fail closed, C1).
+    """
+    if payload is True:
+        return True, None
+    if isinstance(payload, dict) and payload.get("approved") is True:
+        approver = payload.get("approver")
+        return True, approver if isinstance(approver, str) and approver else None
+    return False, None
 
 
 def make_intake(deps: _Deps) -> Node:
@@ -145,7 +211,7 @@ def make_specialist(specialist: Specialist) -> Node:
             tenant_id=draft.tenant_id,
             events=list(state["signal_events"]),
         )
-        finding = await specialist.investigate(ctx)
+        finding = await safe_investigate(specialist, ctx)
         return {"findings": [finding]}  # findings-only: never advances seq
 
     return node
@@ -167,12 +233,10 @@ def make_collect(deps: _Deps) -> Node:
 
 def make_synthesize(deps: _Deps) -> Node:
     async def synthesize(state: IncidentGraphState) -> dict[str, object]:
-        hypotheses = await deps.commander.synthesize(
-            state["draft"].incident_id, list(state["findings"])
+        hypotheses = await safe_synthesize(
+            deps.commander, state["draft"].incident_id, list(state["findings"])
         )
-        if not hypotheses:
-            raise ValueError("commander returned no hypotheses to score")
-        return {"hypotheses": list(hypotheses)}
+        return {"hypotheses": hypotheses}
 
     return synthesize
 
@@ -211,21 +275,47 @@ def make_score(deps: _Deps) -> Node:
 def make_plan_and_decide(deps: _Deps) -> Node:
     async def plan_and_decide(state: IncidentGraphState) -> dict[str, object]:
         em = _Emitter(state, deps.clock)
+        draft = state["draft"]
         top = state["hypotheses"][0]
-        plan = await deps.planner.draft(state["draft"].incident_id, top)
-        # The independent reversibility floor (doc 05 §6) can only *downgrade* the
-        # planner's claim — db.failover stays irreversible even if the planner lies.
-        floor_reversible = classify_reversibility(ActionType(plan.action_type), plan.reversible)
+        plan = await safe_draft(deps.planner, draft.incident_id, top)
         assessment = state["assessment"]
         assert assessment is not None
-        decision = decide_escalation(
-            PolicyInputs(
-                incident_id=state["draft"].incident_id,
-                band=assessment.band,
-                max_tier=deps.grant.max_tier,
-                reversible=floor_reversible,
-                n_competing=state["n_competing"],
+        # The grant only applies to its own tenant and action type, while active and
+        # while the tenant is under its cost ceiling; otherwise it confers T0.
+        tier = effective_tier(
+            deps.grant,
+            tenant_id=draft.tenant_id,
+            action_type=plan.action_type if plan is not None else "",
+            breaker_open=deps.breaker_open(draft.tenant_id),
+        )
+        if plan is None:
+            decision = no_plan_decision(draft.incident_id, assessment, tier)
+        else:
+            # The independent reversibility floor (doc 05 §6) can only *downgrade* the
+            # planner's claim — db.failover stays irreversible even if the planner lies.
+            floor_reversible = classify_reversibility(
+                ActionType(plan.action_type), plan.reversible
             )
+            decision = decide_escalation(
+                PolicyInputs(
+                    incident_id=draft.incident_id,
+                    band=assessment.band,
+                    max_tier=tier,
+                    reversible=floor_reversible,
+                    n_competing=state["n_competing"],
+                )
+            )
+        deps.record(
+            state,
+            "commander",
+            "incident.decided",
+            plan.target if plan is not None else None,
+            {
+                "outcome": decision.outcome,
+                "granted_tier": tier.value,
+                "grant_id": deps.grant.grant_id,
+                "action_type": plan.action_type if plan is not None else None,
+            },
         )
         if decision.outcome == "act_and_report":
             return {"plan": plan, "decision": decision}  # → act
@@ -235,8 +325,15 @@ def make_plan_and_decide(deps: _Deps) -> Node:
             # APPROVAL_REQUESTED is emitted *here* (runs once, before the suspend),
             # so projecting the log while paused already reads AWAITING_APPROVAL.
             em.emit(IncidentEventType.APPROVAL_REQUESTED, "commander")
-            return em.update(plan=plan, decision=decision, page_payload=page)
+            await deps.notify(page)
+            return em.update(
+                plan=plan,
+                decision=decision,
+                page_payload=page,
+                approval_requested_at=deps.clock(),
+            )
         em.emit(IncidentEventType.INCIDENT_ESCALATED, "commander", {"outcome": decision.outcome})
+        await deps.notify(page)
         return em.update(
             plan=plan, decision=decision, page_payload=page, final_state=IncidentState.ESCALATED
         )
@@ -259,10 +356,22 @@ def make_await_approval(deps: _Deps) -> Node:
             }
         )
         em = _Emitter(state, deps.clock)
-        if _coerce_approved(payload):
-            em.emit(IncidentEventType.APPROVAL_GRANTED, "human")
+        approved, approver = _parse_approval(payload)
+        requested_at = state.get("approval_requested_at")
+        expired = (
+            deps.approval_ttl is not None
+            and requested_at is not None
+            and deps.clock() - requested_at > deps.approval_ttl
+        )
+        actor = f"human:{approver}" if approver else "human"
+        if approved and not expired:
+            detail: dict[str, object] = {"approver": approver} if approver else {}
+            em.emit(IncidentEventType.APPROVAL_GRANTED, actor, detail)
+            deps.record(state, actor, "approval.granted", plan.target, {})
             return em.update(approval=True)  # → act
-        em.emit(IncidentEventType.APPROVAL_DENIED, "human")
+        reason = "expired" if approved else "denied"
+        em.emit(IncidentEventType.APPROVAL_DENIED, actor, {"reason": reason})
+        deps.record(state, actor, "approval.denied", plan.target, {"reason": reason})
         return em.update(approval=False, final_state=IncidentState.ESCALATED)
 
     return await_approval
@@ -273,10 +382,26 @@ def make_act(deps: _Deps) -> Node:
         em = _Emitter(state, deps.clock)
         draft = state["draft"]
         plan = state["plan"]
-        assert plan is not None
+        decision = state["decision"]
+        assert plan is not None and decision is not None
+        # Re-checked here: spend may have crossed the ceiling while awaiting approval.
+        if deps.breaker_open(draft.tenant_id):
+            em.emit(
+                IncidentEventType.INCIDENT_ESCALATED, "commander", {"reason": "cost_breaker_open"}
+            )
+            page = _build_page(state, state["hypotheses"][0], plan, decision.outcome)
+            await deps.notify(page)
+            return em.update(page_payload=page, final_state=IncidentState.ESCALATED)
         em.emit(IncidentEventType.REMEDIATION_STARTED, "planner")
-        result = await deps.executor.execute(
-            plan, tenant_id=draft.tenant_id, incident_id=draft.incident_id
+        result = await safe_execute(
+            deps.executor, plan, tenant_id=draft.tenant_id, incident_id=draft.incident_id
+        )
+        deps.record(
+            state,
+            "planner",
+            "action.executed",
+            plan.target,
+            {"action_type": plan.action_type, "status": result.status.value},
         )
         em.emit(IncidentEventType.MONITORING_STARTED, "commander")
         if result.status is ActionStatus.SUCCEEDED and not result.rolled_back:
@@ -285,9 +410,8 @@ def make_act(deps: _Deps) -> Node:
             return em.update(action_result=result, final_state=IncidentState.CLOSED)
         # remediation failed or auto-rolled-back → escalate with the fix attached (C1)
         em.emit(IncidentEventType.INCIDENT_ESCALATED, "commander", {"reason": "remediation_failed"})
-        decision = state["decision"]
-        assert decision is not None
         page = _build_page(state, state["hypotheses"][0], plan, decision.outcome)
+        await deps.notify(page)
         return em.update(
             action_result=result, page_payload=page, final_state=IncidentState.ESCALATED
         )

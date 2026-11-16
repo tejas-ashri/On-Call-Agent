@@ -1,0 +1,563 @@
+"""Safety guarantees around acting, paging and ingesting (C1, C2).
+
+Each test pins one way the system could act when it must not, or stay silent
+when it must page: grants applied outside their scope, forged webhooks, loosely
+parsed approvals, agent failures that aborted the run, pages never delivered,
+alerts dropped by dedup, and the cost breaker not reaching the decision.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import Callable, Sequence
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from langchain_core.runnables import RunnableConfig
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command
+
+from sentinel.audit import AuditLog, verify_chain
+from sentinel.confidence import Calibrator
+from sentinel.connectors import (
+    IntegrationContext,
+    RawSignal,
+    SentryConnector,
+    VercelConnector,
+    webhook_signature,
+)
+from sentinel.contracts import (
+    AutonomyGrant,
+    CanonicalEvent,
+    EvidenceRef,
+    Hypothesis,
+    RemediationPlan,
+    SpecialistFinding,
+    SpecialistRole,
+)
+from sentinel.contracts.actions import ActionResult
+from sentinel.correlator import IncidentDraft
+from sentinel.edge import IngestionEdge, InMemoryDedupStore, InMemoryEventBus
+from sentinel.enums import (
+    ActionStatus,
+    ActionType,
+    AutonomyTier,
+    ConfidenceBand,
+    EventKind,
+    IncidentState,
+    IntegrationMethod,
+    Severity,
+)
+from sentinel.escalation import effective_tier
+from sentinel.graph import IncidentGraphState, build_incident_graph, initial_state
+from sentinel.graph.nodes import _parse_approval
+from sentinel.incidents.events import IncidentEventType
+from sentinel.incidents.projection import project
+from sentinel.notify import CapturingNotifier
+from sentinel.orchestrator import InvestigationContext, run_incident
+from sentinel.orchestrator.guard import UNDETERMINED
+
+_T = datetime(2026, 6, 14, 12, 0, tzinfo=UTC)
+_ROLES: tuple[SpecialistRole, ...] = ("change_deploy", "metric", "trace")
+
+
+# --------------------------------------------------------------------------- builders
+def _event() -> CanonicalEvent:
+    return CanonicalEvent(
+        event_id="evt_1",
+        tenant_id="ten_a",
+        integration_id="int_1",
+        source="sentry",
+        kind=EventKind.ERROR,
+        service="svc_api",
+        severity=Severity.ERROR,
+        title="latency spike",
+        fingerprint="fp1",
+        occurred_at=_T,
+        received_at=_T,
+    )
+
+
+def _draft() -> IncidentDraft:
+    return IncidentDraft(
+        incident_id="inc_1",
+        tenant_id="ten_a",
+        event_ids=["evt_1"],
+        primary_service="svc_api",
+        fingerprints=("fp1",),
+        opened_at=_T,
+    )
+
+
+def _hypothesis() -> Hypothesis:
+    return Hypothesis(
+        hypothesis_id="h1",
+        statement="deploy abc123 exhausted the DB pool",
+        supporting_roles=list(_ROLES),
+        raw_likelihood=0.95,
+    )
+
+
+def _plan() -> RemediationPlan:
+    return RemediationPlan(
+        incident_id="inc_1",
+        action_type="deploy.rollback",
+        target="svc_api",
+        reversible=True,
+        summary="roll back to the prior release",
+        estimated_blast_radius="single_service",
+    )
+
+
+def _grant(tier: AutonomyTier = AutonomyTier.T3, **overrides: object) -> AutonomyGrant:
+    fields: dict[str, object] = {
+        "grant_id": "grant_1",
+        "tenant_id": "ten_a",
+        "action_type": ActionType.DEPLOY_ROLLBACK,
+        "max_tier": tier,
+        "granted_by": "human:1",
+        "granted_at": _T,
+        **overrides,
+    }
+    return AutonomyGrant.model_validate(fields)
+
+
+# --------------------------------------------------------------------------- fakes
+class Specialist:
+    def __init__(self, role: SpecialistRole, *, fail: bool = False) -> None:
+        self.role = role
+        self._fail = fail
+
+    async def investigate(self, ctx: InvestigationContext) -> SpecialistFinding:
+        if self._fail:
+            raise TimeoutError("model timed out")
+        return SpecialistFinding(
+            incident_id=ctx.incident_id,
+            role=self.role,
+            summary=f"{self.role} corroborates deploy abc123",
+            suspected_cause="deploy abc123",
+            self_confidence=0.9,
+            evidence=[EvidenceRef(kind="deploy", summary="abc123", observed_at=_T)],
+        )
+
+
+class Commander:
+    def __init__(self, result: list[Hypothesis] | Exception) -> None:
+        self._result = result
+
+    async def synthesize(
+        self, incident_id: str, findings: Sequence[SpecialistFinding]
+    ) -> list[Hypothesis]:
+        if isinstance(self._result, Exception):
+            raise self._result
+        return self._result
+
+
+class Planner:
+    def __init__(self, result: RemediationPlan | Exception) -> None:
+        self._result = result
+
+    async def draft(self, incident_id: str, hypothesis: Hypothesis) -> RemediationPlan:
+        if isinstance(self._result, Exception):
+            raise self._result
+        return self._result
+
+
+class Executor:
+    def __init__(self, *, fail: bool = False) -> None:
+        self._fail = fail
+        self.calls: list[RemediationPlan] = []
+
+    async def execute(
+        self, plan: RemediationPlan, *, tenant_id: str, incident_id: str
+    ) -> ActionResult:
+        self.calls.append(plan)
+        if self._fail:
+            raise ConnectionError("provider down")
+        return ActionResult(action_id="act_1", status=ActionStatus.SUCCEEDED)
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = _T
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+def _graph(
+    *,
+    grant: AutonomyGrant | None = None,
+    specialists: Sequence[Specialist] | None = None,
+    commander: Commander | None = None,
+    planner: Planner | None = None,
+    executor: Executor | None = None,
+    notifier: CapturingNotifier | None = None,
+    breaker: Callable[[str], bool] | None = None,
+    clock: Callable[[], datetime] = lambda: _T,
+    audit: AuditLog | None = None,
+) -> tuple[CompiledStateGraph[IncidentGraphState], Executor]:
+    ex = executor or Executor()
+    app = build_incident_graph(
+        specialists=list(specialists or [Specialist(r) for r in _ROLES]),
+        commander=commander or Commander([_hypothesis()]),
+        planner=planner or Planner(_plan()),
+        executor=ex,
+        grant=grant or _grant(),
+        calibrator=Calibrator(temperature=1.0, version="cal.test"),
+        clock=clock,
+        notifier=notifier,
+        cost_breaker_open=breaker,
+        audit=audit,
+    )
+    return app, ex
+
+
+def _cfg() -> RunnableConfig:
+    return {"configurable": {"thread_id": "inc_1"}}
+
+
+def _start(app: CompiledStateGraph[IncidentGraphState]) -> dict[str, object]:
+    return dict(asyncio.run(app.ainvoke(initial_state(draft=_draft(), events=[_event()]), _cfg())))
+
+
+def _resume(app: CompiledStateGraph[IncidentGraphState], value: object) -> dict[str, object]:
+    return dict(asyncio.run(app.ainvoke(Command(resume=value), _cfg())))
+
+
+# --------------------------------------------------------------------------- 1. grant scope
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"revoked_at": _T},
+        {"tenant_id": "ten_other"},
+        {"action_type": ActionType.FEATURE_FLAG_TOGGLE},
+    ],
+    ids=["revoked", "other-tenant", "other-action"],
+)
+def test_out_of_scope_grant_confers_nothing(overrides: dict[str, object]) -> None:
+    grant = _grant(AutonomyTier.T3, **overrides)
+    assert effective_tier(grant, tenant_id="ten_a", action_type="deploy.rollback") is (
+        AutonomyTier.T0
+    )
+
+    app, ex = _graph(grant=grant)
+    out = _start(app)
+    assert ex.calls == []
+    assert out["decision"].outcome == "page_with_drafted_fix"  # type: ignore[attr-defined]
+    assert out["final_state"] is IncidentState.ESCALATED
+
+
+def test_constrained_t3_grant_requires_approval() -> None:
+    grant = _grant(AutonomyTier.T3, constraints={"max_rollbacks_per_day": 1})
+    assert effective_tier(grant, tenant_id="ten_a", action_type="deploy.rollback") is (
+        AutonomyTier.T2
+    )
+    app, ex = _graph(grant=grant)
+    out = _start(app)
+    assert "__interrupt__" in out and ex.calls == []
+
+
+def test_in_scope_grant_still_acts() -> None:
+    app, ex = _graph()
+    out = _start(app)
+    assert len(ex.calls) == 1 and out["final_state"] is IncidentState.CLOSED
+
+
+def test_driver_applies_grant_scope_too() -> None:
+    run = asyncio.run(
+        run_incident(
+            draft=_draft(),
+            events=[_event()],
+            specialists=[Specialist(r) for r in _ROLES],
+            commander=Commander([_hypothesis()]),
+            planner=Planner(_plan()),
+            executor=(ex := Executor()),
+            grant=_grant(AutonomyTier.T3, revoked_at=_T),
+            calibrator=Calibrator(temperature=1.0, version="cal.test"),
+            clock=lambda: _T,
+        )
+    )
+    assert ex.calls == [] and run.final_state is IncidentState.ESCALATED
+
+
+# --------------------------------------------------------------------------- 2. webhooks
+_SECRET = "s3cret"
+
+
+def _raw(
+    payload: dict[str, object], *, header: str, sig: str | None, body: bytes | None
+) -> RawSignal:
+    return RawSignal(
+        integration_id="int_1",
+        method=IntegrationMethod.WEBHOOK,
+        payload=payload,
+        headers={header: sig} if sig is not None else {},
+        received_at=_T,
+        body=body,
+    )
+
+
+def _ictx(provider: str) -> IntegrationContext:
+    return IntegrationContext(
+        tenant_id="ten_a", integration_id="int_1", provider=provider, vault_ref="v"
+    )
+
+
+def _verify(connector: SentryConnector | VercelConnector, raw: RawSignal) -> bool:
+    return asyncio.run(connector.verify_webhook(raw, _ictx(connector.capabilities.provider)))
+
+
+_PAYLOAD: dict[str, object] = {"data": {"event": {"event_id": "e1", "issue_id": "7"}}}
+_BODY = json.dumps(_PAYLOAD).encode()
+
+
+def test_correctly_signed_webhooks_are_accepted() -> None:
+    sentry = _raw(
+        _PAYLOAD,
+        header="Sentry-Hook-Signature",
+        sig=webhook_signature(_SECRET, _BODY),
+        body=_BODY,
+    )
+    vercel = _raw(
+        _PAYLOAD,
+        header="x-vercel-signature",
+        sig=webhook_signature(_SECRET, _BODY, "sha1"),
+        body=_BODY,
+    )
+    assert _verify(SentryConnector(webhook_secret=_SECRET), sentry)
+    assert _verify(VercelConnector(webhook_secret=_SECRET), vercel)
+
+
+@pytest.mark.parametrize(
+    ("secret", "sig", "body", "payload"),
+    [
+        (None, webhook_signature(_SECRET, _BODY), _BODY, _PAYLOAD),  # no secret configured
+        (_SECRET, None, _BODY, _PAYLOAD),  # unsigned
+        (_SECRET, webhook_signature("wrong", _BODY), _BODY, _PAYLOAD),  # wrong key
+        (_SECRET, webhook_signature(_SECRET, _BODY), None, _PAYLOAD),  # body not kept
+        (_SECRET, webhook_signature(_SECRET, _BODY), _BODY, {"data": "forged"}),  # swapped
+        (_SECRET, webhook_signature(_SECRET, b"not json"), b"not json", _PAYLOAD),
+    ],
+    ids=["no-secret", "unsigned", "wrong-key", "no-body", "swapped-payload", "non-json"],
+)
+def test_unverifiable_webhooks_are_rejected(
+    secret: str | None, sig: str | None, body: bytes | None, payload: dict[str, object]
+) -> None:
+    raw = _raw(payload, header="sentry-hook-signature", sig=sig, body=body)
+    assert not _verify(SentryConnector(webhook_secret=secret), raw)
+
+
+# --------------------------------------------------------------------------- 3. approvals
+@pytest.mark.parametrize(
+    "value", ["false", "no", "true", 1, None, {}, {"approved": "no"}, {"approved": 1}]
+)
+def test_approval_parser_fails_closed(value: object) -> None:
+    assert _parse_approval(value) == (False, None)
+    assert _parse_approval(True) == (True, None)
+    assert _parse_approval({"approved": True, "approver": "a"}) == (True, "a")
+
+
+@pytest.mark.parametrize("value", ["false", "no", 1, {"approved": "no"}, {"approved": 1}])
+def test_only_an_explicit_true_approves(value: object) -> None:
+    app, ex = _graph(grant=_grant(AutonomyTier.T2))
+    _start(app)
+    final = _resume(app, value)
+    assert ex.calls == []
+    assert final["final_state"] is IncidentState.ESCALATED
+
+
+def test_approval_records_the_approver() -> None:
+    audit = AuditLog()
+    app, ex = _graph(grant=_grant(AutonomyTier.T2), audit=audit)
+    _start(app)
+    final = _resume(app, {"approved": True, "approver": "alice"})
+    assert len(ex.calls) == 1 and final["final_state"] is IncidentState.CLOSED
+    granted = next(
+        e
+        for e in final["event_log"]  # type: ignore[attr-defined]
+        if e.type is IncidentEventType.APPROVAL_GRANTED
+    )
+    assert granted.actor == "human:alice"
+    actions = [e.action for e in audit.entries("ten_a")]
+    assert actions == ["incident.decided", "approval.granted", "action.executed"]
+    assert verify_chain(audit.entries("ten_a")).ok
+
+
+def test_stale_approval_is_treated_as_denial() -> None:
+    clock = Clock()
+    app, ex = _graph(grant=_grant(AutonomyTier.T2), clock=clock)
+    _start(app)
+    clock.now = _T + timedelta(hours=2)
+    final = _resume(app, {"approved": True})
+    assert ex.calls == []
+    denied = final["event_log"][-1]  # type: ignore[index]
+    assert denied.type is IncidentEventType.APPROVAL_DENIED
+    assert denied.payload == {"reason": "expired"}
+    assert project(final["event_log"]).state is IncidentState.ESCALATED  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------- 4. failures page
+def test_failed_specialist_degrades_instead_of_aborting() -> None:
+    notifier = CapturingNotifier()
+    specialists = [Specialist("change_deploy"), Specialist("metric", fail=True)]
+    app, _ = _graph(specialists=specialists, grant=_grant(AutonomyTier.T1), notifier=notifier)
+    out = _start(app)
+    by_role = {f.role: f for f in out["findings"]}  # type: ignore[attr-defined]
+    assert by_role["metric"].status == "degraded"
+    assert by_role["metric"].summary == "metric specialist failed: TimeoutError"
+    assert len(notifier.pages) == 1
+
+
+@pytest.mark.parametrize("result", [RuntimeError("rate limited"), []], ids=["raises", "empty"])
+def test_failed_synthesis_pages_low_confidence(result: list[Hypothesis] | Exception) -> None:
+    notifier = CapturingNotifier()
+    app, ex = _graph(commander=Commander(result), notifier=notifier)
+    out = _start(app)
+    assert ex.calls == []
+    assert out["assessment"].band is ConfidenceBand.LOW  # type: ignore[attr-defined]
+    assert out["decision"].outcome == "page_low_confidence"  # type: ignore[attr-defined]
+    assert notifier.pages[0].suspected_root_cause == UNDETERMINED
+
+
+@pytest.mark.parametrize(
+    "result",
+    [RuntimeError("bad json"), _plan().model_copy(update={"action_type": "rm.rf"})],
+    ids=["raises", "unknown-action"],
+)
+def test_failed_planner_pages_without_a_plan(result: RemediationPlan | Exception) -> None:
+    notifier = CapturingNotifier()
+    app, ex = _graph(planner=Planner(result), notifier=notifier)
+    out = _start(app)
+    assert ex.calls == []
+    assert out["final_state"] is IncidentState.ESCALATED
+    assert notifier.pages[0].drafted_remediation is None
+
+
+def test_raising_executor_escalates_with_the_fix() -> None:
+    notifier = CapturingNotifier()
+    app, ex = _graph(executor=Executor(fail=True), notifier=notifier)
+    out = _start(app)
+    assert len(ex.calls) == 1
+    assert out["action_result"].status is ActionStatus.FAILED  # type: ignore[attr-defined]
+    assert out["final_state"] is IncidentState.ESCALATED
+    assert notifier.pages[0].drafted_remediation == _plan()
+
+
+def test_driver_survives_agent_failures_too() -> None:
+    notifier = CapturingNotifier()
+    run = asyncio.run(
+        run_incident(
+            draft=_draft(),
+            events=[_event()],
+            specialists=[Specialist("metric", fail=True)],
+            commander=Commander(RuntimeError("down")),
+            planner=Planner(RuntimeError("down")),
+            executor=Executor(),
+            grant=_grant(),
+            calibrator=Calibrator(temperature=1.0, version="cal.test"),
+            clock=lambda: _T,
+            notifier=notifier,
+        )
+    )
+    assert run.final_state is IncidentState.ESCALATED
+    assert run.findings[0].status == "degraded"
+    assert len(notifier.pages) == 1
+
+
+# --------------------------------------------------------------------------- 5. pages delivered
+def test_every_paging_outcome_is_delivered() -> None:
+    for tier, interrupted in ((AutonomyTier.T1, False), (AutonomyTier.T2, True)):
+        notifier = CapturingNotifier()
+        app, _ = _graph(grant=_grant(tier), notifier=notifier)
+        out = _start(app)
+        assert ("__interrupt__" in out) is interrupted
+        assert notifier.pages == [out["page_payload"]]
+
+
+def test_clean_autonomous_fix_sends_no_page() -> None:
+    notifier = CapturingNotifier()
+    app, _ = _graph(notifier=notifier)
+    _start(app)
+    assert notifier.pages == []
+
+
+# --------------------------------------------------------------------------- 6. dedup
+class _FlakyBus(InMemoryEventBus):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures = 1
+
+    async def publish(self, event: CanonicalEvent) -> None:
+        if self.failures:
+            self.failures -= 1
+            raise ConnectionError("kafka unavailable")
+        await super().publish(event)
+
+
+def test_failed_publish_does_not_swallow_the_retry() -> None:
+    bus = _FlakyBus()
+    edge = IngestionEdge(bus=bus, dedup=InMemoryDedupStore())
+    connector = SentryConnector(webhook_secret=_SECRET)
+    payload: dict[str, object] = {"data": {"event": {"event_id": "e1", "issue_id": "7"}}}
+    body = json.dumps(payload).encode()
+    raw = _raw(
+        payload, header="sentry-hook-signature", sig=webhook_signature(_SECRET, body), body=body
+    )
+
+    with pytest.raises(ConnectionError):
+        asyncio.run(edge.ingest(raw, _ictx("sentry"), connector))
+    retried = asyncio.run(edge.ingest(raw, _ictx("sentry"), connector))  # provider retry
+    assert len(retried) == 1 and bus.tenant_events("ten_a") == retried
+    assert asyncio.run(edge.ingest(raw, _ictx("sentry"), connector)) == []  # now a real dup
+
+
+# --------------------------------------------------------------------------- 7. cost breaker
+def test_open_breaker_forces_observe_only() -> None:
+    app, ex = _graph(breaker=lambda tenant: tenant == "ten_a")
+    out = _start(app)
+    assert ex.calls == []
+    assert out["decision"].granted_tier is AutonomyTier.T0  # type: ignore[attr-defined]
+
+
+def test_unreadable_breaker_counts_as_open() -> None:
+    def broken(tenant: str) -> bool:
+        raise ConnectionError("redis down")
+
+    app, ex = _graph(breaker=broken)
+    _start(app)
+    assert ex.calls == []
+
+
+def test_breaker_opening_during_approval_blocks_the_action() -> None:
+    state = {"open": False}
+    notifier = CapturingNotifier()
+    app, ex = _graph(
+        grant=_grant(AutonomyTier.T2), breaker=lambda _: state["open"], notifier=notifier
+    )
+    _start(app)
+    state["open"] = True
+    final = _resume(app, {"approved": True})
+    assert ex.calls == []
+    assert final["final_state"] is IncidentState.ESCALATED
+    assert final["event_log"][-1].payload == {"reason": "cost_breaker_open"}  # type: ignore[index]
+    assert len(notifier.pages) == 2  # the approval page, then the escalation
+
+
+def test_driver_honours_the_breaker() -> None:
+    run = asyncio.run(
+        run_incident(
+            draft=_draft(),
+            events=[_event()],
+            specialists=[Specialist(r) for r in _ROLES],
+            commander=Commander([_hypothesis()]),
+            planner=Planner(_plan()),
+            executor=(ex := Executor()),
+            grant=_grant(),
+            calibrator=Calibrator(temperature=1.0, version="cal.test"),
+            clock=lambda: _T,
+            cost_breaker_open=lambda _: True,
+        )
+    )
+    assert ex.calls == [] and run.final_state is IncidentState.ESCALATED
