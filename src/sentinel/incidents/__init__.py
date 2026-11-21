@@ -8,11 +8,21 @@ vocabulary, the immutable event envelope, the projection shape, and the pure
 
 from sentinel.incidents.events import IncidentEvent, IncidentEventType
 from sentinel.incidents.projection import IncidentProjection, fold, project
+from sentinel.incidents.registry import (
+    IncidentRegistry,
+    IncidentStatus,
+    InMemoryIncidentRegistry,
+    TrackedIncident,
+)
 
 __all__ = [
     "IncidentEvent",
     "IncidentEventType",
     "IncidentProjection",
+    "IncidentRegistry",
+    "IncidentStatus",
+    "InMemoryIncidentRegistry",
+    "TrackedIncident",
     "fold",
     "project",
 ]

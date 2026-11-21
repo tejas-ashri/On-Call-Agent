@@ -1,6 +1,6 @@
 """Real Claude-backed agents (opt-in; doc 04 §3).
 
-The LLM realizations of the specialist and commander roles. They depend only on a
+The LLM realizations of the specialist, commander and planner roles. They depend only on a
 ``Completer`` seam — ``(label, system, user) -> assistant_text`` — so the parsing
 and contract-building logic is unit-tested offline with a fake completer, while
 the thin Anthropic adapter (:func:`anthropic_completer`) is exercised by the real
@@ -33,8 +33,15 @@ from anthropic.types import (
 
 from sentinel.agents.meter import CallUsage, TokenMeter
 from sentinel.config import Settings
-from sentinel.contracts import Hypothesis, SpecialistFinding, SpecialistRole
-from sentinel.orchestrator import Commander, InvestigationContext, Specialist
+from sentinel.contracts import (
+    CanonicalEvent,
+    Hypothesis,
+    RemediationPlan,
+    SpecialistFinding,
+    SpecialistRole,
+)
+from sentinel.enums import ActionType
+from sentinel.orchestrator import Commander, InvestigationContext, Planner, Specialist
 from sentinel.tools import Observation, TelemetrySource, Tool, tools_for
 
 # (label, system, user_prompt) -> assistant text. Metering happens inside the real one.
@@ -150,15 +157,33 @@ def _commander_system() -> str:
     )
 
 
+#: Prompt budget for the signals: a storm can carry hundreds of events, and a payload
+#: (stack trace, request context) can be many KB. Bodies beyond these are cut.
+_MAX_PROMPT_EVENTS = 20
+_MAX_BODY_CHARS = 1500
+
+
 def _incident_text(ctx: InvestigationContext) -> str:
-    lines = [f"Incident {ctx.incident_id} — {len(ctx.events)} signal(s):"]
-    for e in ctx.events:
+    return _signals_text(ctx.incident_id, ctx.events)
+
+
+def _signals_text(incident_id: str, events: Sequence[CanonicalEvent]) -> str:
+    lines = [f"Incident {incident_id} — {len(events)} signal(s):"]
+    for e in events[:_MAX_PROMPT_EVENTS]:
         lines.append(
             f"- [{e.source}/{e.kind.value}] {e.title}  "
             f"(service={e.service}, severity={e.severity.value})"
         )
         if e.labels:
             lines.append(f"  labels: {e.labels}")
+        # The edge-redacted provider payload: the stack trace, culprit and request
+        # context the title and labels leave out. Already secret-free (C2).
+        if body := e.body_redacted.strip():
+            if len(body) > _MAX_BODY_CHARS:
+                body = f"{body[:_MAX_BODY_CHARS]}… [truncated]"
+            lines.append(f"  payload: {body}")
+    if (omitted := len(events) - _MAX_PROMPT_EVENTS) > 0:
+        lines.append(f"(+{omitted} more signal(s) omitted)")
     return "\n".join(lines)
 
 
@@ -336,6 +361,107 @@ def _parse_hypothesis(item: dict[str, object], roles: Sequence[SpecialistRole]) 
     )
 
 
+#: Label keys whose values are concrete things an action can target.
+_TARGET_LABELS = ("deployment.id", "commit_sha", "release")
+_BLAST_RADII = ("single_service", "shared", "global")
+
+
+def _candidate_targets(events: Sequence[CanonicalEvent]) -> list[str]:
+    """Every target the incident's signals name, in first-seen order.
+
+    The planner may only pick from these: an action aimed at a deployment or
+    service the signals never mentioned would be a fabricated target (C1).
+    """
+    found: dict[str, None] = {}
+    for e in events:
+        if e.service:
+            found[e.service] = None
+        for key in _TARGET_LABELS:
+            if value := e.labels.get(key):
+                found[value] = None
+    return list(found)
+
+
+def _planner_system() -> str:
+    actions = ", ".join(a.value for a in ActionType)
+    return (
+        "You are the remediation planner in an automated SRE incident triage. Given the "
+        "leading root-cause hypothesis and the incident's redacted signals, propose ONE "
+        "remediation that would mitigate it. You never execute anything: a policy engine, and "
+        "often a human, decides whether it runs. Prefer the least risky reversible action that "
+        "addresses the cause (e.g. rolling back the deploy that introduced a regression over "
+        f"failing over a database). action_type must be one of: {actions}. target must be "
+        "copied exactly from the candidate targets you are given — never invent one. "
+        "Respond with ONLY a JSON object, no prose: "
+        '{"action_type": "<one of the above>", "target": "<a candidate target>", '
+        '"params": {}, "reversible": true | false, "summary": "<one sentence>", '
+        '"command": "<equivalent CLI command, or empty>", '
+        '"estimated_blast_radius": "single_service" | "shared" | "global"}. '
+        'If no listed action fits, respond {"action_type": "none"}.'
+    )
+
+
+def _planner_text(
+    incident_id: str,
+    hypothesis: Hypothesis,
+    events: Sequence[CanonicalEvent],
+    targets: Sequence[str],
+) -> str:
+    lines = [f"Leading hypothesis: {hypothesis.statement}"]
+    if hypothesis.supporting_roles:
+        lines.append(f"Supported by: {', '.join(hypothesis.supporting_roles)}")
+    lines.extend(f"  evidence [{ev.kind}]: {ev.summary}" for ev in hypothesis.evidence)
+    lines.append(f"Candidate targets: {', '.join(targets)}")
+    lines.append("")
+    lines.append(_signals_text(incident_id, events))
+    return "\n".join(lines)
+
+
+class LLMPlanner:
+    """A planner whose remediation is a real Claude call (doc 04 §8).
+
+    Only the *shape* of the plan comes from the model; nothing it claims is
+    trusted further than it can be checked. An unknown action type, ``"none"``,
+    or a target the signals never named raises, which
+    :func:`~sentinel.orchestrator.guard.safe_draft` turns into "no plan" — a page
+    without a drafted fix, never an action. An unstated ``reversible`` reads as
+    ``False`` and an unstated blast radius as ``global``; the reversibility floor
+    can only lower the claim further.
+    """
+
+    def __init__(self, *, complete: Completer) -> None:
+        self._complete = complete
+
+    async def draft(
+        self, incident_id: str, hypothesis: Hypothesis, events: Sequence[CanonicalEvent]
+    ) -> RemediationPlan:
+        targets = _candidate_targets(events)
+        if not targets:
+            raise ValueError("no targetable resource in the incident's signals")
+        text = await self._complete(
+            "planner", _planner_system(), _planner_text(incident_id, hypothesis, events, targets)
+        )
+        data = _extract_json(text)
+        action_type = ActionType(str(data.get("action_type", "")))
+        target = str(data.get("target", "")).strip()
+        if target not in targets:
+            raise ValueError(f"planner target {target!r} is not named by the incident's signals")
+        params = data.get("params")
+        command = data.get("command")
+        radius = data.get("estimated_blast_radius")
+        summary = str(data.get("summary", "")).strip() or f"{action_type.value} {target}"
+        return RemediationPlan(
+            incident_id=incident_id,
+            action_type=action_type.value,
+            target=target,
+            params=params if isinstance(params, dict) else {},
+            reversible=data.get("reversible") is True,
+            summary=summary[:600],
+            command=command.strip() if isinstance(command, str) and command.strip() else None,
+            estimated_blast_radius=radius if radius in _BLAST_RADII else "global",
+        )
+
+
 def anthropic_completer(
     client: AsyncAnthropic, *, model: str, meter: TokenMeter, max_tokens: int = 700
 ) -> Completer:
@@ -433,8 +559,8 @@ def build_llm_agents(
     meter: TokenMeter,
     roles: Sequence[SpecialistRole],
     telemetry: TelemetrySource | None = None,
-) -> tuple[list[Specialist], Commander]:
-    """Construct LLM-backed specialists + commander from settings (requires ``llm_ready``).
+) -> tuple[list[Specialist], Commander, Planner]:
+    """Construct LLM-backed specialists, commander and planner (requires ``llm_ready``).
 
     With ``telemetry``, specialists are :class:`InvestigatingSpecialist`s that query it
     through their role's tools; without it, they are single-call :class:`LLMSpecialist`s.
@@ -455,4 +581,5 @@ def build_llm_agents(
             for role in roles
         ]
     commander: Commander = LLMCommander(complete=complete)
-    return specialists, commander
+    planner: Planner = LLMPlanner(complete=complete)
+    return specialists, commander, planner

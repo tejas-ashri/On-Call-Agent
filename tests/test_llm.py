@@ -10,10 +10,13 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 
-from sentinel.agents.llm import Completer, LLMCommander, LLMSpecialist
-from sentinel.contracts import CanonicalEvent, SpecialistFinding, SpecialistRole
+import pytest
+
+from sentinel.agents.llm import Completer, LLMCommander, LLMPlanner, LLMSpecialist
+from sentinel.contracts import CanonicalEvent, Hypothesis, SpecialistFinding, SpecialistRole
 from sentinel.enums import EventKind, Severity
 from sentinel.orchestrator import InvestigationContext
+from sentinel.orchestrator.guard import safe_draft
 
 _T = datetime(2026, 6, 17, 3, 14, tzinfo=UTC)
 
@@ -156,3 +159,130 @@ def test_commander_unparseable_response_is_unsupported_and_zero_likelihood() -> 
     assert len(hypotheses) == 1
     assert hypotheses[0].raw_likelihood == 0.0
     assert hypotheses[0].supporting_roles == []
+
+
+# ── prompt contents ──────────────────────────────────────────────────────────
+
+
+def _event(i: int, *, body: str = "", labels: dict[str, str] | None = None) -> CanonicalEvent:
+    return CanonicalEvent(
+        event_id=f"evt_{i}",
+        tenant_id="ten_a",
+        integration_id="int_1",
+        source="sentry",
+        kind=EventKind.ERROR,
+        service="svc_api",
+        severity=Severity.ERROR,
+        title=f"error {i}",
+        body_redacted=body,
+        fingerprint=f"fp{i}",
+        labels=labels or {},
+        occurred_at=_T,
+        received_at=_T,
+    )
+
+
+def _capturing() -> tuple[Completer, list[str]]:
+    prompts: list[str] = []
+
+    async def complete(label: str, system: str, user: str) -> str:
+        prompts.append(user)
+        return "{}"
+
+    return complete, prompts
+
+
+def test_specialist_prompt_includes_the_redacted_payload() -> None:
+    comp, prompts = _capturing()
+    ctx = InvestigationContext(
+        incident_id="inc_1",
+        tenant_id="ten_a",
+        events=[_event(1, body='{"culprit": "orders.list", "stacktrace": "db.py:42"}')],
+    )
+    asyncio.run(LLMSpecialist("error", complete=comp).investigate(ctx))
+    assert "db.py:42" in prompts[0]
+    assert "orders.list" in prompts[0]
+
+
+def test_specialist_prompt_bounds_payload_size_and_event_count() -> None:
+    comp, prompts = _capturing()
+    events = [_event(i, body="x" * 5000) for i in range(25)]
+    ctx = InvestigationContext(incident_id="inc_1", tenant_id="ten_a", events=events)
+    asyncio.run(LLMSpecialist("error", complete=comp).investigate(ctx))
+    assert "x" * 1501 not in prompts[0]
+    assert "[truncated]" in prompts[0]
+    assert "error 19" in prompts[0] and "error 20" not in prompts[0]
+    assert "(+5 more signal(s) omitted)" in prompts[0]
+
+
+# ── planner ──────────────────────────────────────────────────────────────────
+
+
+def _hypothesis() -> Hypothesis:
+    return Hypothesis(
+        hypothesis_id="h1",
+        statement="deploy dpl_9 introduced an N+1 query exhausting the DB pool",
+        supporting_roles=["change_deploy", "metric"],
+        raw_likelihood=0.9,
+    )
+
+
+def _deploy_events() -> list[CanonicalEvent]:
+    return [_event(1, labels={"deployment.id": "dpl_9", "commit_sha": "a1b2c3d"})]
+
+
+def _planner(reply: str) -> tuple[LLMPlanner, list[str]]:
+    prompts: list[str] = []
+
+    async def complete(label: str, system: str, user: str) -> str:
+        assert label == "planner"
+        prompts.append(user)
+        return reply
+
+    return LLMPlanner(complete=complete), prompts
+
+
+def test_planner_builds_a_plan_grounded_in_the_signals() -> None:
+    planner, prompts = _planner(
+        '{"action_type": "deploy.rollback", "target": "dpl_9", "reversible": true, '
+        '"summary": "Roll back dpl_9", "command": "vercel rollback dpl_9", '
+        '"estimated_blast_radius": "single_service"}'
+    )
+    plan = asyncio.run(planner.draft("inc_1", _hypothesis(), _deploy_events()))
+    assert plan.action_type == "deploy.rollback"
+    assert plan.target == "dpl_9"
+    assert plan.reversible is True
+    assert plan.command == "vercel rollback dpl_9"
+    assert plan.estimated_blast_radius == "single_service"
+    # the model sees the hypothesis and the targets it may choose from
+    assert "N+1" in prompts[0]
+    assert "Candidate targets: svc_api, dpl_9, a1b2c3d" in prompts[0]
+
+
+def test_planner_defaults_unstated_claims_to_the_conservative_side() -> None:
+    planner, _ = _planner('{"action_type": "process.restart", "target": "svc_api"}')
+    plan = asyncio.run(planner.draft("inc_1", _hypothesis(), _deploy_events()))
+    assert plan.reversible is False
+    assert plan.estimated_blast_radius == "global"
+    assert plan.summary == "process.restart svc_api"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        '{"action_type": "deploy.rollback", "target": "dpl_INVENTED"}',  # fabricated target
+        '{"action_type": "rm -rf", "target": "dpl_9"}',  # unknown action
+        '{"action_type": "none"}',  # nothing fits
+        "I would roll it back.",  # unparseable
+    ],
+)
+def test_planner_rejections_become_no_plan(reply: str) -> None:
+    planner, _ = _planner(reply)
+    assert asyncio.run(safe_draft(planner, "inc_1", _hypothesis(), _deploy_events())) is None
+
+
+def test_planner_without_targetable_signals_makes_no_call() -> None:
+    planner, prompts = _planner('{"action_type": "deploy.rollback", "target": "x"}')
+    bare = _event(1).model_copy(update={"service": None})
+    assert asyncio.run(safe_draft(planner, "inc_1", _hypothesis(), [bare])) is None
+    assert prompts == []

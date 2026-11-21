@@ -14,7 +14,7 @@ import pytest
 from pydantic import ValidationError
 
 from sentinel.contracts import CanonicalEvent
-from sentinel.correlator import IncidentDraft, correlate
+from sentinel.correlator import IncidentDraft, correlate, correlate_with_open
 from sentinel.enums import EventKind, Severity
 
 _BASE = datetime(2026, 6, 13, 12, 0, 0, tzinfo=UTC)
@@ -229,3 +229,84 @@ def test_incident_draft_is_frozen() -> None:
                       new_incident_id=_fixed_ids())[0]
     with pytest.raises(ValidationError):
         draft.__setattr__("tenant_id", "ten_evil")
+
+
+def test_short_sha_joins_the_full_sha_it_abbreviates() -> None:
+    full = "a1b2c3d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3"
+    events = [
+        _ev(event_id="evt_1", fingerprint="fp_1", commit_sha=full),
+        _ev(event_id="evt_2", fingerprint="fp_2", commit_sha="A1B2C3D", offset_s=1.0),
+    ]
+    assert len(correlate(events, window_seconds=60.0)) == 1
+
+
+def test_sha_prefix_shorter_than_an_abbreviation_does_not_join() -> None:
+    events = [
+        _ev(event_id="evt_1", fingerprint="fp_1", commit_sha="a1b2c3d9e8f7"),
+        _ev(event_id="evt_2", fingerprint="fp_2", commit_sha="a1b2", offset_s=1.0),
+    ]
+    assert len(correlate(events, window_seconds=60.0)) == 2
+
+
+# ── correlating against open incidents ──────────────────────────────────────
+
+
+def test_late_event_joins_the_open_incident_it_matches() -> None:
+    open_events = [_ev(event_id="old_1", fingerprint="fp_storm")]
+    late = [_ev(event_id="new_1", fingerprint="fp_storm", offset_s=60.0)]
+    result = correlate_with_open(late, {"inc_open": open_events}, window_seconds=300.0)
+    assert result.drafts == []
+    assert [e.event_id for e in result.attached["inc_open"]] == ["new_1"]
+
+
+def test_new_events_join_an_open_incident_transitively() -> None:
+    # new_2 shares nothing with the open incident, only with new_1, which does.
+    open_events = [_ev(event_id="old_1", fingerprint="fp_a")]
+    new = [
+        _ev(event_id="new_1", fingerprint="fp_a", commit_sha="abc1234", offset_s=10.0),
+        _ev(event_id="new_2", fingerprint="fp_b", commit_sha="abc1234", offset_s=20.0),
+    ]
+    result = correlate_with_open(new, {"inc_open": open_events}, window_seconds=300.0)
+    assert result.drafts == []
+    assert [e.event_id for e in result.attached["inc_open"]] == ["new_1", "new_2"]
+
+
+def test_unrelated_or_out_of_window_events_become_new_incidents() -> None:
+    open_events = [_ev(event_id="old_1", fingerprint="fp_a")]
+    new = [
+        _ev(event_id="new_1", fingerprint="fp_other", offset_s=10.0),
+        _ev(event_id="new_2", fingerprint="fp_a", offset_s=3600.0),
+    ]
+    result = correlate_with_open(
+        new, {"inc_open": open_events}, window_seconds=300.0, new_incident_id=_fixed_ids()
+    )
+    assert result.attached == {}
+    assert [d.event_ids for d in result.drafts] == [["new_1"], ["new_2"]]
+
+
+def test_open_incidents_of_another_tenant_are_never_joined() -> None:
+    open_events = [_ev(event_id="old_1", tenant_id="ten_b", fingerprint="same")]
+    new = [_ev(event_id="new_1", tenant_id="ten_a", fingerprint="same", offset_s=1.0)]
+    result = correlate_with_open(new, {"inc_b": open_events}, window_seconds=300.0)
+    assert result.attached == {}
+    assert len(result.drafts) == 1 and result.drafts[0].tenant_id == "ten_a"
+
+
+def test_redelivered_event_is_not_attached_twice() -> None:
+    open_events = [_ev(event_id="evt_1", fingerprint="fp")]
+    result = correlate_with_open(open_events, {"inc_open": open_events}, window_seconds=300.0)
+    assert result.attached == {} and result.drafts == []
+
+
+def test_cluster_bridging_two_open_incidents_goes_to_the_earliest() -> None:
+    first = [_ev(event_id="old_a", fingerprint="fp_a", offset_s=0.0)]
+    second = [_ev(event_id="old_b", fingerprint="fp_b", offset_s=30.0)]
+    bridge = [
+        _ev(event_id="new_1", fingerprint="fp_a", commit_sha="c0ffee1", offset_s=40.0),
+        _ev(event_id="new_2", fingerprint="fp_b", commit_sha="c0ffee1", offset_s=41.0),
+    ]
+    result = correlate_with_open(
+        bridge, {"inc_b": second, "inc_a": first}, window_seconds=300.0
+    )
+    assert list(result.attached) == ["inc_a"]
+    assert len(result.attached["inc_a"]) == 2

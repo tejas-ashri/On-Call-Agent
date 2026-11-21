@@ -29,8 +29,11 @@ Every external dependency is an injected interface (a Python `Protocol`). That k
 | Area | What exists |
 |------|-------------|
 | Incident graph | LangGraph `StateGraph` with parallel specialist fan-out, conditional routing, a checkpointer, and a real `interrupt()` / `Command(resume=...)` approval step. |
-| Escalation policy | Autonomy tiers T0–T3, grant scoping (tenant, action type, expiry), the reversibility floor, the cost breaker, and approval TTLs. |
-| Confidence scoring | Corroboration counting, competing-hypothesis penalty, temperature-scaling calibration, ECE measurement. |
+| Escalation policy | Autonomy tiers T0–T3, one grant per (tenant, action type) looked up per decision and re-checked before acting, the reversibility floor, the cost breaker, and approval TTLs. |
+| Action safety | Each plan gets a deterministic `action_id`. An action ledger makes execution at-most-once: a crash, retry, or duplicate approval replays the recorded result or escalates as "outcome unknown", never runs the write twice. The ID is also the provider idempotency key. |
+| Approvals | A page carries `one_tap_action_id`; an approval must echo it and name an approver the tenant's approver directory allows. Bare `True`, stale or replayed taps, anonymous or unauthorized approvers, and late approvals are denials. |
+| Incident tracking | A registry of each tenant's open incidents. Late alerts are correlated against open incidents first and attach to them instead of opening a duplicate. Every run reports `closed`, `escalated`, `awaiting_approval`, or `attached`, and `resume_incident` continues a paused one exactly once. |
+| Confidence scoring | Corroboration counting (a specialist counts only if its own suspected cause matches the hypothesis and it cites evidence), competing-hypothesis penalty, temperature-scaling calibration fitted with a held-out ECE check. T3 is capped at approval unless the calibrator was fitted on ≥200 labelled incidents with held-out ECE ≤ 0.05. |
 | Ingestion edge | Signature verification, dedup, normalization, and redaction for **Sentry** and **Vercel** webhooks. |
 | Correlation | Groups a batch of events into incidents by fingerprint, commit SHA, or service within a time window. A Sentry error joins the Vercel deploy that shipped it: the commit SHA is read from Sentry's `release`, and a short SHA matches the full one. |
 | LLM agents | Claude-backed specialists (single-call, or a bounded tool-use loop), the Incident Commander, and the Planner, via the Anthropic Messages API. Specialists see each event's redacted payload (stack trace, culprit), not just its title. |
@@ -41,18 +44,17 @@ Every external dependency is an injected interface (a Python `Protocol`). That k
 ### Not yet implemented
 | Area | Current stand-in |
 |------|------------------|
-| Telemetry read APIs (logs, metrics, traces, deploys, errors) | The specialists' tools read recorded observations from the `golden/` YAML cases (`GoldenTelemetry`). No live `TelemetrySource` exists yet. |
+| Telemetry read APIs (logs, metrics, traces, deploys, errors) | The specialists' tools read the recorded observations (relevant and distractor) in the `golden/` YAML cases (`GoldenTelemetry`). No live `TelemetrySource` exists yet. |
 | Action execution | Connector `_do_execute` returns success without calling the provider; no `ActionExecutor` is wired to the MCP broker. |
 | Event bus | `InMemoryEventBus` (no Kafka client). |
 | Dedup store | `InMemoryDedupStore` (no Redis). |
 | Credential vault | `VaultClient` interface only (no HashiCorp Vault client). |
 | Notifications | `ConsoleNotifier` prints the page (no Slack/SMS). |
-| HTTP service | No server to receive webhooks or the one-tap approval callback. |
-| Streaming correlation | Correlation runs over a fixed batch; there is no rolling window for late-arriving alerts. |
-| Resuming paused incidents | Only the tests resume an interrupted graph; nothing in the runtime does. |
-| Durable checkpointer | Defaults to `InMemorySaver`; paused incidents are lost on restart. |
+| HTTP service | No server to receive webhooks or the one-tap approval callback; `resume_incident` is ready for that endpoint to call. Approver *authentication* (e.g. verifying the Slack user) belongs there too. |
+| Event consumer | The pipeline handles whatever batch it is given; no Kafka consumer feeds it continuously. |
+| Durable state | The action ledger and incident registry have in-memory implementations only, and the approver directory is just a `(tenant_id, approver) → allowed?` callable with no backing store. A graph that accepts approvals refuses to start without an explicit checkpointer, but the Postgres checkpointer isn't wired in. |
 | Service discovery | Connectors stamp the service from the integration's config (`config["service"]`); there is no automatic discovery, so an unconfigured integration's events can't be grouped by service. |
-| Calibration data | The golden library has **5** labelled cases — enough to exercise the math, not to trust the confidence bands. |
+| Calibration data | The golden library has **5** labelled cases, so no calibrator can meet the bar and T3 grants act only after approval. |
 
 ---
 
@@ -76,7 +78,7 @@ When a provider (e.g., Vercel, Sentry) fires a webhook, Sentinel verifies and re
 ## Key Features
 
 ### 1. Graduated Autonomy Ladder (T0–T3)
-**How it works:** Tenants explicitly opt in to automation per action type (`T0`: Observe, `T1`: Suggest, `T2`: Approve-to-act, `T3`: Autonomous). A grant applies only to its own tenant and action type, only while active, and drops to `T0` while the tenant is over its cost ceiling.
+**How it works:** Tenants explicitly opt in to automation per action type (`T0`: Observe, `T1`: Suggest, `T2`: Approve-to-act, `T3`: Autonomous). A grant applies only to its own tenant and action type, only while active, and drops to `T0` while the tenant is over its cost ceiling. It is checked again right before acting, so a revocation during an approval wait takes effect. An approval is bound to the exact action it was shown, and each action runs at most once.
 **Why it exists:** AI tools modifying production infrastructure require immense trust. Sentinel never mutates state without explicit permission, and `T3` acts only on reversible actions at high confidence.
 
 ### 2. Edge-Side Redaction
@@ -86,7 +88,7 @@ When a provider (e.g., Vercel, Sentry) fires a webhook, Sentinel verifies and re
 ### 3. Confidence Calibration
 **How it works:** The commander's likelihood is blended with how many specialists independently corroborate it and how many rival hypotheses are close behind, then passed through a temperature-scaling map fitted by minimizing negative log-likelihood. Calibration quality is measured as Expected Calibration Error (ECE).
 **Why it exists:** LLMs are overconfident. The confidence band gates autonomous action, so it has to mean something.
-**Status:** The fitting and measurement code is complete; the labelled data to fit it on (5 golden cases) is not yet large enough for the bands to be trustworthy.
+**Status:** The fitting and measurement code is complete, and a calibrator records how many labelled incidents it was fitted on and its held-out ECE. Until one clears the bar (≥200 cases, ECE ≤ 0.05), T3 is treated as T2. With 5 golden cases, that is the case today.
 
 ### 4. JIT Credential Brokering
 **How it works:** An MCP router asks a vault for a short-lived credential scoped to a single action. The tenant ID that selects the credential comes from the server-side broker, never from LLM-influenced arguments, and the lease is revoked in a `finally` block.

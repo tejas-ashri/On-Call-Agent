@@ -22,6 +22,7 @@ from sentinel.confidence import (
     Calibrator,
     blend_raw_likelihood,
     build_assessment,
+    cause_agrees,
     independent_corroboration,
 )
 from sentinel.contracts import (
@@ -245,10 +246,16 @@ _T = datetime(2026, 6, 17, 3, 14, tzinfo=UTC)
 _ALL_ROLES: list[SpecialistRole] = ["log", "metric", "trace", "change_deploy", "error"]
 
 
-def _f(role: SpecialistRole, *, evidenced: bool) -> SpecialistFinding:
+def _f(
+    role: SpecialistRole, *, evidenced: bool, cause: str | None = "deploy abc123"
+) -> SpecialistFinding:
     evidence = [EvidenceRef(kind="log", summary=f"{role} saw it", observed_at=_T)]
     return SpecialistFinding(
-        incident_id="inc_1", role=role, summary=role, evidence=evidence if evidenced else []
+        incident_id="inc_1",
+        role=role,
+        summary=role,
+        suspected_cause=cause,
+        evidence=evidence if evidenced else [],
     )
 
 
@@ -257,7 +264,7 @@ def _h(
 ) -> Hypothesis:
     return Hypothesis(
         hypothesis_id="h1",
-        statement="x",
+        statement="deploy abc123 introduced an N+1 query that exhausts the DB pool",
         supporting_roles=supporting,
         contradicting_roles=contradicting or [],
     )
@@ -297,3 +304,32 @@ def test_correlated_agreement_no_longer_inflates_to_high() -> None:
     corroboration = independent_corroboration(_h(_ALL_ROLES), findings)
     assert blend_raw_likelihood(0.5, 5, 0) >= BAND_HIGH_THRESHOLD
     assert band_for(blend_raw_likelihood(0.5, corroboration, 0)) is ConfidenceBand.MEDIUM
+
+
+def test_commander_marked_support_needs_the_specialists_own_agreement() -> None:
+    # The commander says all five support; only the two whose own causes match count.
+    findings = [
+        _f("change_deploy", evidenced=True),
+        _f("metric", evidenced=True, cause="connection pool exhausted"),
+        _f("trace", evidenced=True, cause="CDN cache misses on static assets"),
+        _f("log", evidenced=True, cause=None),
+        _f("error", evidenced=True, cause="unrelated TLS certificate warning"),
+    ]
+    assert independent_corroboration(_h(_ALL_ROLES), findings) == 2
+
+
+@pytest.mark.parametrize(
+    ("cause", "agrees"),
+    [
+        ("deploy abc123", True),
+        ("Deploy ABC123 introduced an N+1", True),
+        ("connection pool exhausted", True),  # stems: exhausted ~ exhausts
+        ("CDN cache misses on static assets", False),
+        ("a deploy happened", False),  # one generic shared word is not agreement
+        ("", False),
+        (None, False),
+    ],
+)
+def test_cause_agreement(cause: str | None, agrees: bool) -> None:
+    statement = "deploy abc123 introduced an N+1 query that exhausts the DB pool"
+    assert cause_agrees(cause, statement) is agrees

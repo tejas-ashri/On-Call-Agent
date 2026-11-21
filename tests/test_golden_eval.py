@@ -70,3 +70,14 @@ def test_golden_expected_outcomes_per_tier(case: GoldenCase) -> None:
     for tier, expected in case.expected.expected_outcome_by_grant.items():
         d = decide_escalation(PolicyInputs(case.incident_id, band, tier, rev))
         assert d.outcome == expected, f"{case.id}@{tier.value}: {d.outcome} != {expected}"
+
+
+@pytest.mark.parametrize("case", load_golden(), ids=lambda c: c.id)
+def test_observations_hold_every_cited_evidence_plus_distractors(case: GoldenCase) -> None:
+    # Specialists investigate the observations, so each piece of cited evidence must be
+    # findable there; and something uncited must be too, or the tools would serve
+    # exactly the answer key.
+    observed = {(o.kind, o.summary) for o in case.observations}
+    cited = {(ev.kind, ev.summary) for f in case.findings for ev in f.evidence}
+    assert cited <= observed
+    assert observed - cited, "no distractor observations"

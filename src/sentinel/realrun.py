@@ -3,8 +3,8 @@
     PYTHONPATH=src ./.venv/bin/python -m sentinel.realrun [--tools]
 
 Requires ``ANTHROPIC_API_KEY`` in ``.env`` and ``SENTINEL_USE_LLM=1`` (else it
-prints how to configure and exits without calling anything). Uses 3 specialists +
-the commander on the cheapest model to keep the spend to a couple of cents, and a
+prints how to configure and exits without calling anything). Uses 3 specialists,
+the commander and the planner on the cheapest model to keep the spend to a couple of cents, and a
 T1 ("suggest") grant so it never touches prod — it pages with Claude's diagnosis
 and a drafted fix.
 
@@ -40,8 +40,6 @@ from sentinel.demo import (
     _ctx,
     _Executor,
     _grant,
-    _plan,
-    _Planner,
     _sentry_raw,
 )
 from sentinel.edge import (
@@ -52,10 +50,11 @@ from sentinel.edge import (
 )
 from sentinel.enums import AutonomyTier, IncidentState
 from sentinel.graph import build_incident_graph
+from sentinel.incidents import InMemoryIncidentRegistry
 from sentinel.notify import render_page
 from sentinel.tools import GoldenTelemetry
 
-# 3 specialists keeps the real run to ~5 cheap calls.
+# 3 specialists keeps the real run to ~6 cheap calls.
 _ROLES: tuple[SpecialistRole, ...] = ("change_deploy", "metric", "log")
 
 
@@ -78,10 +77,9 @@ async def run_real_incident(
 
         case = next(c for c in load_golden() if c.id == "gold_0007")
         telemetry = GoldenTelemetry.from_case(case)
-    specialists, commander = build_llm_agents(
+    specialists, commander, planner = build_llm_agents(
         settings=settings, meter=meter, roles=_ROLES, telemetry=telemetry
     )
-    planner = _Planner(_plan())
 
     # Ingest a real-shaped incident; the edge redacts before the model sees anything.
     bus = InMemoryEventBus()
@@ -100,14 +98,18 @@ async def run_real_incident(
         commander=commander,
         planner=planner,
         executor=_Executor(),
-        grant=_grant(AutonomyTier.T1),  # suggest-only: never acts, always pages with the fix
+        grants=[_grant(AutonomyTier.T1)],  # suggest-only: never acts, always pages with the fix
         calibrator=Calibrator(temperature=1.0, version="cal.real"),
         clock=lambda: _T,
     )
-    states = await run_incident_pipeline(
-        events=events, app=app, window_seconds=300.0, new_incident_id=lambda: "inc_real"
+    results = await run_incident_pipeline(
+        events=events,
+        app=app,
+        registry=InMemoryIncidentRegistry(),
+        window_seconds=300.0,
+        new_incident_id=lambda: "inc_real",
     )
-    state = states[0]
+    state = cast(dict[str, object], results[0].state)
 
     findings = cast(list[SpecialistFinding], state["findings"])
     hypotheses = cast(list[Hypothesis], state["hypotheses"])

@@ -37,6 +37,27 @@ findings:
         summary: "POST /checkout 500 rate 0→38% at 09:40"
         observed_at: "2026-05-20T09:41:00Z"
         raw_ref: "obj://redacted/log_chk_0031"
+observations:
+  - kind: error
+    summary: "new exception group, 1.2k events in 5 min, all release 2.4.0"
+    observed_at: "2026-05-20T09:40:00Z"
+    raw_ref: "obj://redacted/err_grp_0031"
+  - kind: error
+    summary: "long-standing 'ResizeObserver loop limit exceeded' group, steady at ~40/hour"
+    observed_at: "2026-05-20T09:30:00Z"
+    raw_ref: "obj://redacted/err_resize_0031"
+  - kind: log
+    summary: "POST /checkout 500 rate 0→38% at 09:40"
+    observed_at: "2026-05-20T09:41:00Z"
+    raw_ref: "obj://redacted/log_chk_0031"
+  - kind: log
+    summary: "cron job nightly-digest finished in 41s (normal)"
+    observed_at: "2026-05-20T09:35:00Z"
+    raw_ref: "obj://redacted/log_cron_0031"
+  - kind: metric
+    summary: "database connections 18/100, unchanged"
+    observed_at: "2026-05-20T09:41:00Z"
+    raw_ref: "obj://redacted/met_db_0031"
 expected:
   root_cause_class: "release_regression.unhandled_exception"
   primary_service_kind: "web"

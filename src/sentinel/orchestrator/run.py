@@ -43,17 +43,25 @@ from sentinel.contracts import (
 )
 from sentinel.contracts.actions import ActionResult
 from sentinel.correlator import IncidentDraft
-from sentinel.enums import ActionStatus, ActionType, IncidentState
-from sentinel.escalation import PolicyInputs, decide_escalation, effective_tier
+from sentinel.enums import ActionStatus, ActionType, AutonomyTier, IncidentState
+from sentinel.escalation import (
+    GrantLookup,
+    PolicyInputs,
+    as_grant_lookup,
+    decide_escalation,
+    effective_tier,
+    resolve_grant,
+)
 from sentinel.incidents.events import IncidentEvent, IncidentEventType
 from sentinel.notify import Notifier
 from sentinel.orchestrator.guard import (
+    execute_once,
     no_plan_decision,
     safe_draft,
-    safe_execute,
     safe_investigate,
     safe_synthesize,
 )
+from sentinel.orchestrator.ledger import ActionLedger, InMemoryActionLedger, action_id_for
 from sentinel.orchestrator.protocols import (
     ActionExecutor,
     Commander,
@@ -94,12 +102,14 @@ async def run_incident(
     commander: Commander,
     planner: Planner,
     executor: ActionExecutor,
-    grant: AutonomyGrant,
+    grants: GrantLookup | Sequence[AutonomyGrant],
     calibrator: Calibrator,
     competing_margin: float = 0.15,
     clock: Callable[[], datetime] = _utcnow,
     notifier: Notifier | None = None,
     cost_breaker_open: Callable[[str], bool] | None = None,
+    ledger: ActionLedger | None = None,
+    require_calibrated_autonomy: bool = True,
 ) -> IncidentRun:
     """Run one incident end to end and return a fully-recorded :class:`IncidentRun`.
 
@@ -107,6 +117,8 @@ async def run_incident(
     ``act_and_report`` touches prod (via ``executor``); every other outcome pages
     a human with the drafted fix attached and never acts (C1). ``notifier``
     delivers that page; ``cost_breaker_open`` forces T0 for an over-budget tenant.
+    ``grants``, ``ledger`` and ``require_calibrated_autonomy`` behave as in
+    :func:`sentinel.graph.build_incident_graph`.
     """
     incident_id = draft.incident_id
     tenant_id = draft.tenant_id
@@ -172,13 +184,21 @@ async def run_incident(
     emit(IncidentEventType.INCIDENT_DIAGNOSED, "commander")
 
     # plan + the independent reversibility floor (doc 05 §6) feeding the policy (doc 04 §7)
-    plan = await safe_draft(planner, incident_id, top)
+    plan = await safe_draft(planner, incident_id, top, events)
+    action_type = plan.action_type if plan is not None else ""
     tier = effective_tier(
-        grant,
+        resolve_grant(as_grant_lookup(grants), tenant_id=tenant_id, action_type=action_type),
         tenant_id=tenant_id,
-        action_type=plan.action_type if plan is not None else "",
+        action_type=action_type,
         breaker_open=_breaker_open(cost_breaker_open, tenant_id),
     )
+    if (
+        tier is AutonomyTier.T3
+        and require_calibrated_autonomy
+        and not calibrator.trusted_for_autonomy()
+    ):
+        tier = AutonomyTier.T2  # an unvalidated calibrator's HIGH band is not enough to act
+    action_id = action_id_for(incident_id, plan) if plan is not None else None
     if plan is None:
         decision = no_plan_decision(incident_id, assessment, tier)
     else:
@@ -199,10 +219,15 @@ async def run_incident(
     final_state: IncidentState
 
     if decision.outcome == "act_and_report":
-        assert plan is not None  # decide_escalation only runs with a plan
+        assert plan is not None and action_id is not None  # only decided with a plan
         emit(IncidentEventType.REMEDIATION_STARTED, "planner")
-        action_result = await safe_execute(
-            executor, plan, tenant_id=tenant_id, incident_id=incident_id
+        action_result = await execute_once(
+            executor,
+            ledger or InMemoryActionLedger(),
+            plan,
+            tenant_id=tenant_id,
+            incident_id=incident_id,
+            action_id=action_id,
         )
         emit(IncidentEventType.MONITORING_STARTED, "commander")
         if action_result.status is ActionStatus.SUCCEEDED and not action_result.rolled_back:
@@ -218,10 +243,12 @@ async def run_incident(
             )
             final_state = IncidentState.ESCALATED
     else:
+        awaiting = decision.target_state == "AWAITING_APPROVAL"
         page_payload = _build_page(
             tenant_id, top, assessment, evidence_chain, hypotheses, plan, decision.outcome
         )
-        if decision.target_state == "AWAITING_APPROVAL":
+        if awaiting:
+            page_payload = page_payload.model_copy(update={"one_tap_action_id": action_id})
             emit(IncidentEventType.APPROVAL_REQUESTED, "commander")
             final_state = IncidentState.AWAITING_APPROVAL
         else:

@@ -3,7 +3,8 @@
 Each test pins one way the system could act when it must not, or stay silent
 when it must page: grants applied outside their scope, forged webhooks, loosely
 parsed approvals, agent failures that aborted the run, pages never delivered,
-alerts dropped by dedup, and the cost breaker not reaching the decision.
+alerts dropped by dedup, the cost breaker not reaching the decision, an action
+executed twice, an approval of the wrong action, and a grant revoked mid-wait.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
@@ -49,15 +51,18 @@ from sentinel.enums import (
     IntegrationMethod,
     Severity,
 )
-from sentinel.escalation import effective_tier
+from sentinel.escalation import GrantLookup, effective_tier, grant_lookup
 from sentinel.graph import IncidentGraphState, build_incident_graph, initial_state
 from sentinel.graph.nodes import _parse_approval
 from sentinel.incidents.events import IncidentEventType
 from sentinel.incidents.projection import project
 from sentinel.notify import CapturingNotifier
 from sentinel.orchestrator import InvestigationContext, run_incident
-from sentinel.orchestrator.guard import UNDETERMINED
+from sentinel.orchestrator.guard import UNDETERMINED, execute_once
+from sentinel.orchestrator.ledger import ActionLedger, InMemoryActionLedger, action_id_for
 
+# fitted and validated, so T3 grants may act (the calibration gate has its own tests)
+_TRUSTED_CAL = Calibrator(temperature=1.0, version="cal.test", fitted_on=1000, holdout_ece=0.01)
 _T = datetime(2026, 6, 14, 12, 0, tzinfo=UTC)
 _ROLES: tuple[SpecialistRole, ...] = ("change_deploy", "metric", "trace")
 
@@ -158,7 +163,9 @@ class Planner:
     def __init__(self, result: RemediationPlan | Exception) -> None:
         self._result = result
 
-    async def draft(self, incident_id: str, hypothesis: Hypothesis) -> RemediationPlan:
+    async def draft(
+        self, incident_id: str, hypothesis: Hypothesis, events: Sequence[CanonicalEvent]
+    ) -> RemediationPlan:
         if isinstance(self._result, Exception):
             raise self._result
         return self._result
@@ -168,14 +175,16 @@ class Executor:
     def __init__(self, *, fail: bool = False) -> None:
         self._fail = fail
         self.calls: list[RemediationPlan] = []
+        self.action_ids: list[str] = []
 
     async def execute(
-        self, plan: RemediationPlan, *, tenant_id: str, incident_id: str
+        self, plan: RemediationPlan, *, tenant_id: str, incident_id: str, action_id: str
     ) -> ActionResult:
         self.calls.append(plan)
+        self.action_ids.append(action_id)
         if self._fail:
             raise ConnectionError("provider down")
-        return ActionResult(action_id="act_1", status=ActionStatus.SUCCEEDED)
+        return ActionResult(action_id=action_id, status=ActionStatus.SUCCEEDED)
 
 
 class Clock:
@@ -188,7 +197,11 @@ class Clock:
 
 def _graph(
     *,
+    calibrator: Calibrator = _TRUSTED_CAL,
+    require_calibrated_autonomy: bool = True,
     grant: AutonomyGrant | None = None,
+    grants: GrantLookup | Sequence[AutonomyGrant] | None = None,
+    ledger: ActionLedger | None = None,
     specialists: Sequence[Specialist] | None = None,
     commander: Commander | None = None,
     planner: Planner | None = None,
@@ -197,6 +210,7 @@ def _graph(
     breaker: Callable[[str], bool] | None = None,
     clock: Callable[[], datetime] = lambda: _T,
     audit: AuditLog | None = None,
+    approvers: Callable[[str, str], bool] | None = lambda tenant_id, who: who == "alice",
 ) -> tuple[CompiledStateGraph[IncidentGraphState], Executor]:
     ex = executor or Executor()
     app = build_incident_graph(
@@ -204,12 +218,16 @@ def _graph(
         commander=commander or Commander([_hypothesis()]),
         planner=planner or Planner(_plan()),
         executor=ex,
-        grant=grant or _grant(),
-        calibrator=Calibrator(temperature=1.0, version="cal.test"),
+        grants=grants if grants is not None else [grant or _grant()],
+        ledger=ledger,
+        calibrator=calibrator,
+        require_calibrated_autonomy=require_calibrated_autonomy,
         clock=clock,
         notifier=notifier,
         cost_breaker_open=breaker,
         audit=audit,
+        approvers=approvers,
+        checkpointer=InMemorySaver(),
     )
     return app, ex
 
@@ -224,6 +242,17 @@ def _start(app: CompiledStateGraph[IncidentGraphState]) -> dict[str, object]:
 
 def _resume(app: CompiledStateGraph[IncidentGraphState], value: object) -> dict[str, object]:
     return dict(asyncio.run(app.ainvoke(Command(resume=value), _cfg())))
+
+
+def _action_id(app: CompiledStateGraph[IncidentGraphState]) -> str:
+    return str(asyncio.run(app.aget_state(_cfg())).values["action_id"])
+
+
+def _approve(
+    app: CompiledStateGraph[IncidentGraphState], approver: str = "alice"
+) -> dict[str, object]:
+    """Resume with a well-formed approval of the paused incident's action."""
+    return _resume(app, {"approved": True, "action_id": _action_id(app), "approver": approver})
 
 
 # --------------------------------------------------------------------------- 1. grant scope
@@ -274,8 +303,8 @@ def test_driver_applies_grant_scope_too() -> None:
             commander=Commander([_hypothesis()]),
             planner=Planner(_plan()),
             executor=(ex := Executor()),
-            grant=_grant(AutonomyTier.T3, revoked_at=_T),
-            calibrator=Calibrator(temperature=1.0, version="cal.test"),
+            grants=[_grant(AutonomyTier.T3, revoked_at=_T)],
+            calibrator=_TRUSTED_CAL,
             clock=lambda: _T,
         )
     )
@@ -351,15 +380,25 @@ def test_unverifiable_webhooks_are_rejected(
 
 # --------------------------------------------------------------------------- 3. approvals
 @pytest.mark.parametrize(
-    "value", ["false", "no", "true", 1, None, {}, {"approved": "no"}, {"approved": 1}]
+    "value", [True, "false", "no", "true", 1, None, {}, {"approved": "no"}, {"approved": 1}]
 )
 def test_approval_parser_fails_closed(value: object) -> None:
-    assert _parse_approval(value) == (False, None)
-    assert _parse_approval(True) == (True, None)
-    assert _parse_approval({"approved": True, "approver": "a"}) == (True, "a")
+    approver, reason = _parse_approval(value, "act_x")
+    assert reason is not None
+    ok = {"approved": True, "action_id": "act_x", "approver": "a"}
+    assert _parse_approval(ok, "act_x") == ("a", None)
 
 
-@pytest.mark.parametrize("value", ["false", "no", 1, {"approved": "no"}, {"approved": 1}])
+def test_approval_parser_binds_to_the_action_and_requires_an_approver() -> None:
+    stale = {"approved": True, "action_id": "act_old", "approver": "a"}
+    assert _parse_approval(stale, "act_x") == ("a", "action_mismatch")
+    anonymous = {"approved": True, "action_id": "act_x"}
+    assert _parse_approval(anonymous, "act_x") == (None, "no_approver")
+
+
+@pytest.mark.parametrize(
+    "value", [True, "false", "no", 1, {"approved": "no"}, {"approved": 1}, {"approved": True}]
+)
 def test_only_an_explicit_true_approves(value: object) -> None:
     app, ex = _graph(grant=_grant(AutonomyTier.T2))
     _start(app)
@@ -372,7 +411,7 @@ def test_approval_records_the_approver() -> None:
     audit = AuditLog()
     app, ex = _graph(grant=_grant(AutonomyTier.T2), audit=audit)
     _start(app)
-    final = _resume(app, {"approved": True, "approver": "alice"})
+    final = _approve(app)
     assert len(ex.calls) == 1 and final["final_state"] is IncidentState.CLOSED
     granted = next(
         e
@@ -390,7 +429,7 @@ def test_stale_approval_is_treated_as_denial() -> None:
     app, ex = _graph(grant=_grant(AutonomyTier.T2), clock=clock)
     _start(app)
     clock.now = _T + timedelta(hours=2)
-    final = _resume(app, {"approved": True})
+    final = _approve(app)
     assert ex.calls == []
     denied = final["event_log"][-1]  # type: ignore[index]
     assert denied.type is IncidentEventType.APPROVAL_DENIED
@@ -455,8 +494,8 @@ def test_driver_survives_agent_failures_too() -> None:
             commander=Commander(RuntimeError("down")),
             planner=Planner(RuntimeError("down")),
             executor=Executor(),
-            grant=_grant(),
-            calibrator=Calibrator(temperature=1.0, version="cal.test"),
+            grants=[_grant()],
+            calibrator=_TRUSTED_CAL,
             clock=lambda: _T,
             notifier=notifier,
         )
@@ -538,7 +577,7 @@ def test_breaker_opening_during_approval_blocks_the_action() -> None:
     )
     _start(app)
     state["open"] = True
-    final = _resume(app, {"approved": True})
+    final = _approve(app)
     assert ex.calls == []
     assert final["final_state"] is IncidentState.ESCALATED
     assert final["event_log"][-1].payload == {"reason": "cost_breaker_open"}  # type: ignore[index]
@@ -554,10 +593,232 @@ def test_driver_honours_the_breaker() -> None:
             commander=Commander([_hypothesis()]),
             planner=Planner(_plan()),
             executor=(ex := Executor()),
-            grant=_grant(),
-            calibrator=Calibrator(temperature=1.0, version="cal.test"),
+            grants=[_grant()],
+            calibrator=_TRUSTED_CAL,
             clock=lambda: _T,
             cost_breaker_open=lambda _: True,
         )
     )
     assert ex.calls == [] and run.final_state is IncidentState.ESCALATED
+
+
+# --------------------------------------------------------------------------- 6. at-most-once
+def test_action_id_is_deterministic_and_tracks_what_the_write_does() -> None:
+    plan = _plan()
+    assert action_id_for("inc_1", plan) == action_id_for("inc_1", plan)
+    reworded = plan.model_copy(update={"summary": "different words, same rollback"})
+    assert action_id_for("inc_1", reworded) == action_id_for("inc_1", plan)
+    assert action_id_for("inc_1", plan.model_copy(update={"target": "svc_b"})) != (
+        action_id_for("inc_1", plan)
+    )
+    assert action_id_for("inc_2", plan) != action_id_for("inc_1", plan)
+
+
+def test_execute_once_replays_the_recorded_result_instead_of_acting_again() -> None:
+    ledger, ex = InMemoryActionLedger(), Executor()
+
+    def run() -> ActionResult:
+        return asyncio.run(
+            execute_once(ex, ledger, _plan(), tenant_id="ten_a", incident_id="inc_1",
+                         action_id="act_x")
+        )
+
+    first, second = run(), run()
+    assert len(ex.calls) == 1
+    assert ex.action_ids == ["act_x"]  # the idempotency key reaches the executor
+    assert second == first
+
+
+def test_claimed_action_without_a_result_escalates_as_outcome_unknown() -> None:
+    # The process died between the provider call and recording its result.
+    ledger, ex = InMemoryActionLedger(), Executor()
+    asyncio.run(ledger.claim("act_x"))
+    result = asyncio.run(
+        execute_once(ex, ledger, _plan(), tenant_id="ten_a", incident_id="inc_1",
+                     action_id="act_x")
+    )
+    assert ex.calls == []
+    assert result.status is ActionStatus.FAILED
+    assert "outcome unknown" in result.detail
+
+
+class BrokenLedger:
+    async def claim(self, action_id: str) -> bool:
+        raise ConnectionError("db down")
+
+    async def complete(self, action_id: str, result: ActionResult) -> None:
+        raise ConnectionError("db down")
+
+    async def result(self, action_id: str) -> ActionResult | None:
+        raise ConnectionError("db down")
+
+
+def test_unavailable_ledger_never_executes() -> None:
+    app, ex = _graph(grant=_grant(AutonomyTier.T3), ledger=BrokenLedger())
+    out = _start(app)
+    assert ex.calls == []
+    assert out["final_state"] is IncidentState.ESCALATED
+
+
+def test_rerunning_an_incident_does_not_repeat_its_action() -> None:
+    # A retried run of the same incident (crash before the act checkpoint, a
+    # redelivered trigger) reaches act again with the same decision.
+    ledger = InMemoryActionLedger()
+    ex = Executor()
+    for thread in ("run_1", "run_2"):
+        app, _ = _graph(grant=_grant(AutonomyTier.T3), ledger=ledger, executor=ex)
+        cfg: RunnableConfig = {"configurable": {"thread_id": thread}}
+        out = asyncio.run(app.ainvoke(initial_state(draft=_draft(), events=[_event()]), cfg))
+        assert out["final_state"] is IncidentState.CLOSED
+    assert len(ex.calls) == 1
+
+
+# --------------------------------------------------------------------------- 7. bound approvals
+def test_page_and_interrupt_carry_the_one_tap_action_id() -> None:
+    app, _ = _graph(grant=_grant(AutonomyTier.T2))
+    out = _start(app)
+    action_id = action_id_for("inc_1", _plan())
+    assert out["action_id"] == action_id
+    assert out["page_payload"].one_tap_action_id == action_id  # type: ignore[attr-defined]
+    assert out["__interrupt__"][0].value["action_id"] == action_id  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    [
+        ({"approved": True, "action_id": "act_stale", "approver": "alice"}, "action_mismatch"),
+        ({"approved": True, "approver": "alice"}, "action_mismatch"),
+        ({"approved": True, "action_id": "<current>"}, "no_approver"),
+        ({"approved": True, "action_id": "<current>", "approver": "mallory"},
+         "unauthorized_approver"),
+    ],
+    ids=["stale-tap", "unbound", "anonymous", "not-an-approver"],
+)
+def test_approval_must_name_this_action_and_an_authorized_approver(
+    payload: dict[str, object], reason: str
+) -> None:
+    app, ex = _graph(grant=_grant(AutonomyTier.T2))
+    _start(app)
+    if payload.get("action_id") == "<current>":
+        payload = {**payload, "action_id": _action_id(app)}
+    final = _resume(app, payload)
+    assert ex.calls == []
+    assert final["event_log"][-1].payload == {"reason": reason}  # type: ignore[index]
+    assert final["final_state"] is IncidentState.ESCALATED
+
+
+def test_without_an_approver_directory_no_approval_succeeds() -> None:
+    app, ex = _graph(grant=_grant(AutonomyTier.T2), approvers=None)
+    _start(app)
+    final = _approve(app)
+    assert ex.calls == []
+    assert final["event_log"][-1].payload == {"reason": "unauthorized_approver"}  # type: ignore[index]
+
+
+def test_failing_approver_directory_denies() -> None:
+    def broken(tenant_id: str, who: str) -> bool:
+        raise ConnectionError("directory down")
+
+    app, ex = _graph(grant=_grant(AutonomyTier.T2), approvers=broken)
+    _start(app)
+    _approve(app)
+    assert ex.calls == []
+
+
+# --------------------------------------------------------------------------- 8. per-action grants
+def _restart_plan() -> RemediationPlan:
+    return _plan().model_copy(update={"action_type": "process.restart"})
+
+
+def test_each_action_type_uses_its_own_grant() -> None:
+    grants = [
+        _grant(AutonomyTier.T1),  # deploy.rollback: suggest only
+        _grant(AutonomyTier.T3, grant_id="grant_2", action_type=ActionType.PROCESS_RESTART),
+    ]
+    app, ex = _graph(grants=grants, planner=Planner(_restart_plan()))
+    out = _start(app)
+    assert out["decision"].granted_tier is AutonomyTier.T3  # type: ignore[attr-defined]
+    assert len(ex.calls) == 1 and out["final_state"] is IncidentState.CLOSED
+
+    app, ex = _graph(grants=grants)  # the rollback plan still gets only T1
+    out = _start(app)
+    assert ex.calls == []
+    assert out["decision"].outcome == "page_with_drafted_fix"  # type: ignore[attr-defined]
+
+
+def test_grant_lookup_prefers_active_then_the_lowest_tier() -> None:
+    lookup = grant_lookup(
+        [
+            _grant(AutonomyTier.T3, grant_id="revoked", revoked_at=_T),
+            _grant(AutonomyTier.T3, grant_id="t3"),
+            _grant(AutonomyTier.T2, grant_id="t2"),
+        ]
+    )
+    chosen = lookup("ten_a", "deploy.rollback")
+    assert chosen is not None and chosen.grant_id == "t2"
+    assert lookup("ten_a", "process.restart") is None
+    assert lookup("ten_b", "deploy.rollback") is None
+
+
+def test_failing_grant_store_confers_nothing() -> None:
+    def broken(tenant_id: str, action_type: str) -> AutonomyGrant | None:
+        raise ConnectionError("db down")
+
+    app, ex = _graph(grants=broken)
+    out = _start(app)
+    assert ex.calls == []
+    assert out["decision"].granted_tier is AutonomyTier.T0  # type: ignore[attr-defined]
+
+
+def test_grant_revoked_while_awaiting_approval_blocks_the_action() -> None:
+    live = {"grant": _grant(AutonomyTier.T2)}
+    app, ex = _graph(grants=lambda tenant_id, action_type: live["grant"])
+    _start(app)
+    live["grant"] = _grant(AutonomyTier.T2, revoked_at=_T)
+    final = _approve(app)
+    assert ex.calls == []
+    assert final["event_log"][-1].payload == {"reason": "grant_no_longer_permits"}  # type: ignore[index]
+    assert final["final_state"] is IncidentState.ESCALATED
+
+
+# --------------------------------------------------------------------------- 9. calibration gate
+def test_unvalidated_calibrator_caps_t3_at_approval() -> None:
+    untrusted = Calibrator(temperature=1.0, version="hand-picked")
+    app, ex = _graph(grant=_grant(AutonomyTier.T3), calibrator=untrusted)
+    out = _start(app)
+    assert ex.calls == []  # a HIGH band from an unvalidated map does not move prod
+    assert out["decision"].granted_tier is AutonomyTier.T2  # type: ignore[attr-defined]
+    assert out["decision"].outcome == "page_one_tap"  # type: ignore[attr-defined]
+    assert "__interrupt__" in out
+
+
+def test_validated_calibrator_allows_t3_to_act() -> None:
+    app, ex = _graph(grant=_grant(AutonomyTier.T3))
+    out = _start(app)
+    assert len(ex.calls) == 1 and out["final_state"] is IncidentState.CLOSED
+
+
+def test_calibration_cap_can_be_lifted_explicitly() -> None:
+    untrusted = Calibrator(temperature=1.0, version="demo")
+    app, ex = _graph(
+        grant=_grant(AutonomyTier.T3), calibrator=untrusted, require_calibrated_autonomy=False
+    )
+    _start(app)
+    assert len(ex.calls) == 1
+
+
+def test_driver_applies_the_same_calibration_cap() -> None:
+    run = asyncio.run(
+        run_incident(
+            draft=_draft(),
+            events=[_event()],
+            specialists=[Specialist(r) for r in _ROLES],
+            commander=Commander([_hypothesis()]),
+            planner=Planner(_plan()),
+            executor=(ex := Executor()),
+            grants=[_grant(AutonomyTier.T3)],
+            calibrator=Calibrator(temperature=1.0, version="hand-picked"),
+        )
+    )
+    assert ex.calls == []
+    assert run.final_state is IncidentState.AWAITING_APPROVAL

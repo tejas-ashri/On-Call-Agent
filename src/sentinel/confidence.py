@@ -23,7 +23,9 @@ core (:mod:`sentinel.enums`, :mod:`sentinel.contracts`) and never mutates it.
 
 from __future__ import annotations
 
+import json
 import math
+import re
 from collections.abc import Sequence
 
 from sentinel.contracts import ConfidenceAssessment, Hypothesis, SpecialistFinding
@@ -33,6 +35,57 @@ from sentinel.enums import band_for
 # clips probabilities to ``[1e-6, 1 - 1e-6]`` for the same reason).
 _EPSILON = 1e-6
 
+#: The bar a calibrator must clear before its bands may authorize autonomous (T3)
+#: action: fitted on at least this many labelled incidents, with an expected
+#: calibration error on held-out cases no worse than this (doc 06 §6.2).
+MIN_CALIBRATION_CASES = 200
+MAX_CALIBRATION_ECE = 0.05
+
+
+#: Words that carry no diagnostic meaning when comparing causes.
+_STOPWORDS = frozenset(
+    {
+        "the", "and", "that", "this", "with", "from", "into", "after", "before", "for", "was",
+        "were", "has", "have", "had", "are", "its", "not", "but", "all", "any", "due", "via", "per",
+        "our",
+        "their", "than", "then", "them", "they", "which", "while", "when", "where", "caused",
+        "causing", "cause", "causes", "likely", "possible", "probably", "root", "issue", "problem",
+    }
+)
+_TERM = re.compile(r"[a-z0-9][a-z0-9_.+-]*")
+#: Share of the shorter description's key terms that must be exceeded in the other.
+_MIN_CAUSE_AGREEMENT = 0.5
+
+
+def _stem(term: str) -> str:
+    """Crude suffix stripping so 'exhausts' / 'exhausted' / 'exhausting' compare equal."""
+    for suffix in ("ing", "ed", "es", "s"):
+        if term.endswith(suffix) and len(term) - len(suffix) >= 4:
+            return term[: -len(suffix)]
+    return term
+
+
+def _key_terms(text: str) -> set[str]:
+    terms = (t.strip(".-") for t in _TERM.findall(text.lower()))
+    return {_stem(t) for t in terms if len(t) >= 3 and t not in _STOPWORDS}
+
+
+def cause_agrees(suspected_cause: str | None, statement: str) -> bool:
+    """Whether a specialist's own suspected cause names the same thing as a hypothesis.
+
+    A cheap, deterministic check: more than half of the shorter description's key
+    terms (identifiers like ``abc123`` included) must appear in the other. It is
+    deliberately strict — a missed match only lowers confidence and pages more; a
+    false match would inflate it. A specialist that named no cause agrees with
+    nothing.
+    """
+    if not suspected_cause:
+        return False
+    cause, claim = _key_terms(suspected_cause), _key_terms(statement)
+    if not cause or not claim:
+        return False
+    return len(cause & claim) / min(len(cause), len(claim)) > _MIN_CAUSE_AGREEMENT
+
 
 def independent_corroboration(
     hypothesis: Hypothesis, findings: Sequence[SpecialistFinding]
@@ -40,13 +93,20 @@ def independent_corroboration(
     """Count the *independent* corroboration behind ``hypothesis`` (doc 04 §6).
 
     :func:`blend_raw_likelihood` assumes each corroborating specialist is an
-    independent signal. That only holds when a specialist grounds its view in its
-    own evidence. Specialists that cite no evidence all reasoned over the same
-    shared incident snapshot (typically the same model with a different role
-    prompt), so their agreement is one correlated opinion, not N confirmations::
+    independent signal. Two things must hold for a specialist to count:
 
-        independent = |supporting roles that cite their own evidence|
-                    + (1 if any supporting role cites none, else 0)
+    * **It agrees on its own.** The commander (an LLM) marks which roles support
+      a hypothesis; that mark is only accepted when the specialist's own
+      ``suspected_cause`` names the same thing (:func:`cause_agrees`). The
+      commander's opinion of who agrees is not itself evidence.
+    * **It is grounded.** Specialists that cite no evidence all reasoned over the
+      same shared incident snapshot (typically the same model with a different
+      role prompt), so their agreement is one correlated opinion, not N
+      confirmations::
+
+        agreeing    = commander-marked supporters whose own cause matches
+        independent = |agreeing roles that cite their own evidence|
+                    + (1 if any agreeing role cites none, else 0)
         corroboration = max(0, independent - |contradicting roles|)
 
     Contradictions are deliberately *not* discounted: dissent should cost
@@ -60,9 +120,14 @@ def independent_corroboration(
     Returns:
         The net independent corroboration count (``≥ 0``).
     """
+    cause_of = {f.role: f.suspected_cause for f in findings}
+    agreeing = {
+        role
+        for role in hypothesis.supporting_roles
+        if cause_agrees(cause_of.get(role), hypothesis.statement)
+    }
     evidenced = {f.role for f in findings if f.evidence}
-    supporting = set(hypothesis.supporting_roles)
-    independent = len(supporting & evidenced) + (1 if supporting - evidenced else 0)
+    independent = len(agreeing & evidenced) + (1 if agreeing - evidenced else 0)
     return max(0, independent - len(set(hypothesis.contradicting_roles)))
 
 
@@ -136,22 +201,77 @@ class Calibrator:
     onto each :class:`~sentinel.contracts.ConfidenceAssessment` for auditability.
     """
 
-    __slots__ = ("temperature", "version")
+    __slots__ = ("fitted_on", "holdout_ece", "temperature", "version")
 
-    def __init__(self, temperature: float, version: str) -> None:
+    def __init__(
+        self,
+        temperature: float,
+        version: str,
+        *,
+        fitted_on: int = 0,
+        holdout_ece: float | None = None,
+    ) -> None:
         """Construct a calibrator.
 
         Args:
             temperature: The scalar ``T`` of doc 06 §6.3; must be ``> 0``.
             version: The fitted-map identifier stamped as ``calibrator_version``.
+            fitted_on: How many labelled incidents the fit used; ``0`` means the map
+                was never fitted (a hand-picked ``T``).
+            holdout_ece: Expected calibration error measured on held-out cases, if
+                any were held out.
 
         Raises:
-            ValueError: If ``temperature`` is not strictly positive.
+            ValueError: If ``temperature`` is not strictly positive or ``fitted_on``
+                is negative.
         """
         if temperature <= 0.0:
             raise ValueError(f"temperature must be > 0: {temperature}")
+        if fitted_on < 0:
+            raise ValueError(f"fitted_on must be >= 0: {fitted_on}")
         self.temperature = temperature
         self.version = version
+        self.fitted_on = fitted_on
+        self.holdout_ece = holdout_ece
+
+    def trusted_for_autonomy(
+        self, *, min_cases: int = MIN_CALIBRATION_CASES, max_ece: float = MAX_CALIBRATION_ECE
+    ) -> bool:
+        """Whether this map's bands are evidenced enough to authorize T3 action.
+
+        An unfitted map (``T`` chosen by hand), one fitted on too few incidents, or
+        one never checked on held-out cases gives bands that only *look* calibrated —
+        so HIGH from it must not move prod without a human.
+        """
+        return (
+            self.fitted_on >= min_cases
+            and self.holdout_ece is not None
+            and self.holdout_ece <= max_ece
+        )
+
+    def to_json(self) -> str:
+        """Serialize the fitted map — it is versioned configuration, not code."""
+        return json.dumps(
+            {
+                "version": self.version,
+                "temperature": self.temperature,
+                "fitted_on": self.fitted_on,
+                "holdout_ece": self.holdout_ece,
+            },
+            sort_keys=True,
+        )
+
+    @classmethod
+    def from_json(cls, text: str) -> Calibrator:
+        """Load a map written by :meth:`to_json`."""
+        data = json.loads(text)
+        ece = data.get("holdout_ece")
+        return cls(
+            float(data["temperature"]),
+            str(data["version"]),
+            fitted_on=int(data.get("fitted_on", 0)),
+            holdout_ece=float(ece) if ece is not None else None,
+        )
 
     def apply(self, raw: float) -> float:
         """Apply temperature scaling to a raw likelihood (doc 06 §6.3).

@@ -7,6 +7,7 @@ from __future__ import annotations
 from sentinel.eval.calibration import (
     ReliabilityBin,
     expected_calibration_error,
+    fit_calibrator,
     fit_temperature,
     negative_log_likelihood,
     reliability_and_ece,
@@ -29,6 +30,7 @@ __all__ = [
     "RubricScore",
     "build_llm_judge",
     "expected_calibration_error",
+    "fit_calibrator",
     "fit_temperature",
     "golden_dir",
     "judge_diagnosis",

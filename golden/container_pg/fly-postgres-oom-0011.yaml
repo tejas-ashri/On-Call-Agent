@@ -36,6 +36,27 @@ findings:
         summary: "kernel OOM-killer entry precedes each machine restart"
         observed_at: "2026-05-09T02:25:10Z"
         raw_ref: "obj://redacted/log_oom_0011"
+observations:
+  - kind: metric
+    summary: "RSS sawtooth to the 512MB cap; 7 restarts/hour"
+    observed_at: "2026-05-09T02:24:00Z"
+    raw_ref: "obj://redacted/met_rss_0011"
+  - kind: metric
+    summary: "Postgres replication lag 40ms, within normal range"
+    observed_at: "2026-05-09T02:23:00Z"
+    raw_ref: "obj://redacted/met_lag_0011"
+  - kind: log
+    summary: "kernel OOM-killer entry precedes each machine restart"
+    observed_at: "2026-05-09T02:25:10Z"
+    raw_ref: "obj://redacted/log_oom_0011"
+  - kind: log
+    summary: "worker logged 'retrying job 8812 after transient 503 from payments API'"
+    observed_at: "2026-05-09T02:20:00Z"
+    raw_ref: "obj://redacted/log_retry_0011"
+  - kind: deploy
+    summary: "fly.toml env var LOG_LEVEL changed to debug two days earlier"
+    observed_at: "2026-05-07T10:00:00Z"
+    raw_ref: "obj://redacted/cfg_loglevel_0011"
 expected:
   root_cause_class: "resource_exhaustion.oom_restart_loop"
   primary_service_kind: "worker"

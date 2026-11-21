@@ -17,6 +17,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
 from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
@@ -54,6 +55,8 @@ from sentinel.orchestrator import (
     run_incident,
 )
 
+# fitted and validated, so T3 grants may act (the calibration gate has its own tests)
+_TRUSTED_CAL = Calibrator(temperature=1.0, version="cal.test", fitted_on=1000, holdout_ece=0.01)
 _T = datetime(2026, 6, 14, 12, 0, tzinfo=UTC)
 
 
@@ -158,7 +161,9 @@ class FakePlanner:
     def __init__(self, plan: RemediationPlan) -> None:
         self._plan = plan
 
-    async def draft(self, incident_id: str, hypothesis: Hypothesis) -> RemediationPlan:
+    async def draft(
+        self, incident_id: str, hypothesis: Hypothesis, events: Sequence[CanonicalEvent]
+    ) -> RemediationPlan:
         return self._plan
 
 
@@ -168,7 +173,7 @@ class RecordingExecutor:
         self.calls: list[RemediationPlan] = []
 
     async def execute(
-        self, plan: RemediationPlan, *, tenant_id: str, incident_id: str
+        self, plan: RemediationPlan, *, tenant_id: str, incident_id: str, action_id: str
     ) -> ActionResult:
         self.calls.append(plan)
         return self._result
@@ -196,15 +201,25 @@ def _graph(
         commander=commander,
         planner=planner,
         executor=ex,
-        grant=_grant(grant_tier),
-        calibrator=Calibrator(temperature=1.0, version="cal.test"),
+        grants=[_grant(grant_tier)],
+        calibrator=_TRUSTED_CAL,
         clock=lambda: _T,
+        approvers=lambda tenant_id, who: who == "alice",
+        checkpointer=InMemorySaver(),
     )
     return app, rec
 
 
 def _cfg(thread: str = "inc_1") -> RunnableConfig:
     return {"configurable": {"thread_id": thread}}
+
+
+def _approval(
+    app: CompiledStateGraph[IncidentGraphState], *, approved: bool = True
+) -> Command[str]:
+    """Resume with an approval bound to the paused incident's one-tap action id."""
+    action_id = asyncio.run(app.aget_state(_cfg())).values["action_id"]
+    return Command(resume={"approved": approved, "action_id": action_id, "approver": "alice"})
 
 
 # --------------------------------------------------------------------------- tests
@@ -246,7 +261,7 @@ def test_t2_resume_approved_acts_and_closes() -> None:
     app, rec = _graph(grant_tier=AutonomyTier.T2)
     asyncio.run(app.ainvoke(initial_state(draft=_draft(), events=[_event()]), _cfg()))
 
-    final = asyncio.run(app.ainvoke(Command(resume={"approved": True}), _cfg()))
+    final = asyncio.run(app.ainvoke(_approval(app), _cfg()))
 
     assert len(rec.calls) == 1  # resumed past the interrupt and acted exactly once
     assert final["action_result"].status is ActionStatus.SUCCEEDED
@@ -258,7 +273,7 @@ def test_t2_resume_denied_escalates_without_acting() -> None:
     app, rec = _graph(grant_tier=AutonomyTier.T2)
     asyncio.run(app.ainvoke(initial_state(draft=_draft(), events=[_event()]), _cfg()))
 
-    final = asyncio.run(app.ainvoke(Command(resume={"approved": False}), _cfg()))
+    final = asyncio.run(app.ainvoke(_approval(app, approved=False), _cfg()))
 
     assert rec.calls == []  # a denial is a hard stop — no side effect, ever (C1)
     assert final["final_state"] is IncidentState.ESCALATED
@@ -296,7 +311,7 @@ def test_event_log_seq_is_gapfree_across_resume() -> None:
     # The hardest seq case: the stream must stay contiguous *across* the suspend.
     app, _ = _graph(grant_tier=AutonomyTier.T2)
     asyncio.run(app.ainvoke(initial_state(draft=_draft(), events=[_event()]), _cfg()))
-    final = asyncio.run(app.ainvoke(Command(resume={"approved": True}), _cfg()))
+    final = asyncio.run(app.ainvoke(_approval(app), _cfg()))
 
     seqs = [e.seq for e in final["event_log"]]
     assert seqs == list(range(1, len(seqs) + 1))  # 1..N, gap-free over the resume boundary
@@ -324,8 +339,8 @@ def test_graph_matches_driver_on_autonomous_path() -> None:
             commander=FakeCommander([_hypothesis()]),
             planner=FakePlanner(_plan()),
             executor=rec2,
-            grant=_grant(AutonomyTier.T3),
-            calibrator=Calibrator(temperature=1.0, version="cal.test"),
+            grants=[_grant(AutonomyTier.T3)],
+            calibrator=_TRUSTED_CAL,
             clock=lambda: _T,
         )
     )
@@ -380,7 +395,7 @@ class _BrokerExecutor:
         self._router = router
 
     async def execute(
-        self, plan: RemediationPlan, *, tenant_id: str, incident_id: str
+        self, plan: RemediationPlan, *, tenant_id: str, incident_id: str, action_id: str
     ) -> ActionResult:
         broker = ToolBroker(tenant_id=tenant_id, incident_id=incident_id, router=self._router)
         result = await broker.call(

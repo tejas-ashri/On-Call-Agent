@@ -54,9 +54,15 @@ class Commander(Protocol):
 
 
 class Planner(Protocol):
-    """Drafts a remediation for the leading hypothesis; never executes (doc 04 §8)."""
+    """Drafts a remediation for the leading hypothesis; never executes (doc 04 §8).
 
-    async def draft(self, incident_id: str, hypothesis: Hypothesis) -> RemediationPlan: ...
+    ``events`` are the incident's redacted signals — the planner needs them to name
+    a concrete target (the deployment to roll back, the service to restart).
+    """
+
+    async def draft(
+        self, incident_id: str, hypothesis: Hypothesis, events: Sequence[CanonicalEvent]
+    ) -> RemediationPlan: ...
 
 
 class ActionExecutor(Protocol):
@@ -68,5 +74,8 @@ class ActionExecutor(Protocol):
     """
 
     async def execute(
-        self, plan: RemediationPlan, *, tenant_id: str, incident_id: str
-    ) -> ActionResult: ...
+        self, plan: RemediationPlan, *, tenant_id: str, incident_id: str, action_id: str
+    ) -> ActionResult:
+        """Perform the write. ``action_id`` is stable across retries of the same
+        decision; pass it to the provider as the idempotency key."""
+        ...

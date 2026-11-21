@@ -17,11 +17,13 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 
 import pytest
+from langgraph.checkpoint.memory import InMemorySaver
 
 from sentinel.confidence import Calibrator
 from sentinel.connectors.base import IntegrationContext, RawSignal, webhook_signature
 from sentinel.connectors.sentry import SentryConnector
 from sentinel.contracts import (
+    CanonicalEvent,
     EvidenceRef,
     Hypothesis,
     RemediationPlan,
@@ -32,10 +34,13 @@ from sentinel.contracts.actions import ActionResult
 from sentinel.contracts.autonomy import AutonomyGrant
 from sentinel.correlator import correlate
 from sentinel.edge import (
+    IncidentNotAwaitingApproval,
     IngestionEdge,
     InMemoryDedupStore,
     InMemoryEventBus,
+    PipelineResult,
     WebhookRejected,
+    resume_incident,
     run_incident_pipeline,
 )
 from sentinel.enums import (
@@ -46,15 +51,23 @@ from sentinel.enums import (
     IntegrationMethod,
 )
 from sentinel.graph import build_incident_graph
+from sentinel.incidents import InMemoryIncidentRegistry, TrackedIncident
 from sentinel.orchestrator import Commander, InvestigationContext, Planner, Specialist
 
+# fitted and validated, so T3 grants may act (the calibration gate has its own tests)
+_TRUSTED_CAL = Calibrator(temperature=1.0, version="cal.test", fitted_on=1000, holdout_ece=0.01)
 _T = datetime(2026, 6, 14, 12, 0, tzinfo=UTC)
 _SECRET = "test-sentry-client-secret"
 
 
 # --------------------------------------------------------------------------- builders
 def _sentry_raw(
-    *, event_id: str = "ev_s1", issue_id: str = "777", title: str = "boom", culprit: str = "h.get"
+    *,
+    event_id: str = "ev_s1",
+    issue_id: str = "777",
+    title: str = "boom",
+    culprit: str = "h.get",
+    timestamp: float = 1750000000.0,
 ) -> RawSignal:
     event: dict[str, object] = {
         "event_id": event_id,
@@ -64,7 +77,7 @@ def _sentry_raw(
         "title": title,
         "culprit": culprit,
         "release": "abc123",
-        "timestamp": 1750000000.0,
+        "timestamp": timestamp,
     }
     payload: dict[str, object] = {"data": {"event": event}}
     body = json.dumps(payload).encode()
@@ -155,7 +168,9 @@ class FakePlanner:
     def __init__(self, plan: RemediationPlan) -> None:
         self._plan = plan
 
-    async def draft(self, incident_id: str, hypothesis: Hypothesis) -> RemediationPlan:
+    async def draft(
+        self, incident_id: str, hypothesis: Hypothesis, events: Sequence[CanonicalEvent]
+    ) -> RemediationPlan:
         return self._plan
 
 
@@ -165,7 +180,7 @@ class RecordingExecutor:
         self.calls: list[RemediationPlan] = []
 
     async def execute(
-        self, plan: RemediationPlan, *, tenant_id: str, incident_id: str
+        self, plan: RemediationPlan, *, tenant_id: str, incident_id: str, action_id: str
     ) -> ActionResult:
         self.calls.append(plan)
         return self._result
@@ -176,7 +191,9 @@ class _RejectingConnector(SentryConnector):
         return False
 
 
-def _autonomous_app(rec: RecordingExecutor):  # type: ignore[no-untyped-def]
+def _autonomous_app(  # type: ignore[no-untyped-def]
+    rec: RecordingExecutor, tier: AutonomyTier = AutonomyTier.T3
+):
     specialists: list[Specialist] = [
         FakeSpecialist("change_deploy"),
         FakeSpecialist("metric"),
@@ -189,9 +206,11 @@ def _autonomous_app(rec: RecordingExecutor):  # type: ignore[no-untyped-def]
         commander=commander,
         planner=planner,
         executor=rec,
-        grant=_grant(AutonomyTier.T3),
-        calibrator=Calibrator(temperature=1.0, version="cal.test"),
+        grants=[_grant(tier)],
+        calibrator=_TRUSTED_CAL,
         clock=lambda: _T,
+        approvers=lambda tenant_id, who: who == "alice",
+        checkpointer=InMemorySaver(),
     )
 
 
@@ -259,13 +278,16 @@ def test_pipeline_collapses_storm_into_one_closed_incident() -> None:
         run_incident_pipeline(
             events=bus.tenant_events("ten_a"),
             app=app,
+            registry=InMemoryIncidentRegistry(),
             window_seconds=300.0,
             new_incident_id=lambda: next(ids),
         )
     )
 
     assert len(results) == 1  # the storm collapsed to ONE incident
-    assert results[0]["final_state"] is IncidentState.CLOSED
+    assert results[0].status == "closed"
+    assert results[0].state is not None
+    assert results[0].state["final_state"] is IncidentState.CLOSED
     assert len(rec.calls) == 1  # acted exactly once for the incident
 
 
@@ -285,3 +307,151 @@ def test_tenant_keyed_bus_isolates_incidents() -> None:
     # correlation over one partition yields only that tenant's incident
     a_drafts = correlate(a_events, window_seconds=300.0, new_incident_id=lambda: "inc_a")
     assert len(a_drafts) == 1 and a_drafts[0].tenant_id == "ten_a"
+
+
+# --------------------------------------------------------------------------- open incidents
+class _Batches:
+    """Feeds successive webhook batches through one edge, pipeline and registry."""
+
+    def __init__(self, tier: AutonomyTier) -> None:
+        self.rec = RecordingExecutor(ActionResult(action_id="act_1", status=ActionStatus.SUCCEEDED))
+        self.app = _autonomous_app(self.rec, tier)
+        self.registry = InMemoryIncidentRegistry()
+        self._ids = iter(f"inc_{i}" for i in range(1, 100))
+        self._bus = InMemoryEventBus()
+        self._edge = IngestionEdge(bus=self._bus, dedup=InMemoryDedupStore())
+        self._seen = 0
+
+    def deliver(self, *raws: RawSignal) -> list[PipelineResult]:
+        for raw in raws:
+            asyncio.run(self._edge.ingest(raw, _ctx(), _connector()))
+        events = self._bus.tenant_events("ten_a")[self._seen :]
+        self._seen += len(events)
+        return asyncio.run(
+            run_incident_pipeline(
+                events=events,
+                app=self.app,
+                registry=self.registry,
+                window_seconds=300.0,
+                new_incident_id=lambda: next(self._ids),
+            )
+        )
+
+    def approve(self, result: PipelineResult, approver: str = "alice") -> PipelineResult:
+        payload = {"approved": True, "action_id": result.action_id, "approver": approver}
+        return asyncio.run(
+            resume_incident(
+                app=self.app,
+                registry=self.registry,
+                incident_id=result.incident_id,
+                approval=payload,
+            )
+        )
+
+    def tracked(self, incident_id: str) -> TrackedIncident:
+        incident = asyncio.run(self.registry.get(incident_id))
+        assert incident is not None
+        return incident
+
+
+def test_paused_incident_is_reported_as_awaiting_approval_not_finished() -> None:
+    batches = _Batches(AutonomyTier.T2)
+    [result] = batches.deliver(_sentry_raw(event_id="ev_a"))
+    assert result.status == "awaiting_approval"
+    assert result.action_id is not None and result.action_id.startswith("act_")
+    assert batches.tracked("inc_1").status == "awaiting_approval"
+    assert batches.rec.calls == []
+
+
+def test_resume_incident_continues_the_paused_run_once() -> None:
+    batches = _Batches(AutonomyTier.T2)
+    [paused] = batches.deliver(_sentry_raw(event_id="ev_a"))
+    done = batches.approve(paused)
+    assert done.status == "closed"
+    assert len(batches.rec.calls) == 1
+    assert batches.tracked("inc_1").status == "closed"
+    with pytest.raises(IncidentNotAwaitingApproval):  # a second tap on the same page
+        batches.approve(paused)
+    assert len(batches.rec.calls) == 1
+
+
+def test_resume_of_an_unknown_incident_is_refused() -> None:
+    batches = _Batches(AutonomyTier.T2)
+    with pytest.raises(IncidentNotAwaitingApproval):
+        batches.approve(PipelineResult(incident_id="inc_nope", status="awaiting_approval"))
+
+
+def test_late_alert_joins_the_open_incident_instead_of_opening_another() -> None:
+    batches = _Batches(AutonomyTier.T2)
+    [paused] = batches.deliver(_sentry_raw(event_id="ev_a"))
+    [late] = batches.deliver(_sentry_raw(event_id="ev_b", timestamp=1750000060.0))
+    assert late.status == "attached"
+    assert late.incident_id == paused.incident_id
+    assert len(late.attached_event_ids) == 1
+    assert len(batches.tracked("inc_1").events) == 2
+    assert asyncio.run(batches.registry.get("inc_2")) is None  # no twin incident
+
+
+def test_alert_outside_the_window_opens_a_new_incident() -> None:
+    batches = _Batches(AutonomyTier.T2)
+    batches.deliver(_sentry_raw(event_id="ev_a"))
+    [later] = batches.deliver(_sentry_raw(event_id="ev_b", timestamp=1750000000.0 + 3600))
+    assert later.status == "awaiting_approval"
+    assert later.incident_id == "inc_2"
+
+
+def test_recurrence_after_a_closed_incident_is_a_new_incident() -> None:
+    batches = _Batches(AutonomyTier.T3)
+    [first] = batches.deliver(_sentry_raw(event_id="ev_a"))
+    assert first.status == "closed"
+    [again] = batches.deliver(_sentry_raw(event_id="ev_b", timestamp=1750000060.0))
+    assert again.incident_id == "inc_2" and again.status == "closed"
+
+
+def test_escalated_incident_stays_open_until_resolved() -> None:
+    batches = _Batches(AutonomyTier.T1)  # pages, never acts → escalated
+    [first] = batches.deliver(_sentry_raw(event_id="ev_a"))
+    assert first.status == "escalated"
+    [late] = batches.deliver(_sentry_raw(event_id="ev_b", timestamp=1750000060.0))
+    assert late.status == "attached"  # a human owns it; no second page
+    asyncio.run(batches.registry.resolve(first.incident_id))
+    [after] = batches.deliver(_sentry_raw(event_id="ev_c", timestamp=1750000120.0))
+    assert after.incident_id == "inc_2"
+
+
+class _CrashingApp:
+    async def ainvoke(self, *args: object, **kwargs: object) -> dict[str, object]:
+        raise RuntimeError("worker died")
+
+
+def test_crashed_run_is_marked_failed_so_the_next_alert_retries() -> None:
+    registry = InMemoryIncidentRegistry()
+    bus = InMemoryEventBus()
+    edge = IngestionEdge(bus=bus, dedup=InMemoryDedupStore())
+    asyncio.run(edge.ingest(_sentry_raw(event_id="ev_a"), _ctx(), _connector()))
+    with pytest.raises(RuntimeError):
+        asyncio.run(
+            run_incident_pipeline(
+                events=bus.tenant_events("ten_a"),
+                app=_CrashingApp(),  # type: ignore[arg-type]
+                registry=registry,
+                window_seconds=300.0,
+                new_incident_id=lambda: "inc_1",
+            )
+        )
+    tracked = asyncio.run(registry.get("inc_1"))
+    assert tracked is not None and tracked.status == "failed"
+    assert asyncio.run(registry.open_for("ten_a")) == []
+
+
+def test_graph_accepting_approvals_requires_an_explicit_checkpointer() -> None:
+    with pytest.raises(ValueError, match="durable checkpointer"):
+        build_incident_graph(
+            specialists=[],
+            commander=FakeCommander([_hypothesis()]),
+            planner=FakePlanner(_plan()),
+            executor=RecordingExecutor(ActionResult(action_id="a", status=ActionStatus.SUCCEEDED)),
+            grants=[_grant(AutonomyTier.T2)],
+            calibrator=_TRUSTED_CAL,
+            approvers=lambda tenant_id, who: True,
+        )

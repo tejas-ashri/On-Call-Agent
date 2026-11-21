@@ -10,6 +10,9 @@ how true that is and fits the map that makes it true:
   (§6.2). ECE is the headline calibration metric (the CI gate caps it).
 * :func:`fit_temperature` — fit the scalar ``T`` of :class:`sentinel.confidence.Calibrator`
   by minimizing negative log-likelihood (§6.3). ``T > 1`` softens over-confidence.
+* :func:`fit_calibrator` — fit ``T`` on a training split, measure ECE on the held-out
+  rest, and return a :class:`~sentinel.confidence.Calibrator` that records both, so the
+  runtime can tell whether its bands are trustworthy enough to act on.
 
 Deliberately stdlib-only (the doc sketches it in numpy/scipy; we port it to plain ``math``
 to match :mod:`sentinel.confidence` and keep the core dependency-light). The minimizer is a
@@ -21,6 +24,8 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+
+from sentinel.confidence import Calibrator
 
 _EPSILON = 1e-6  # clip probabilities off the logit/log singularities at 0 and 1 (§6.3)
 
@@ -147,3 +152,35 @@ def fit_temperature(
             d = a + inv_phi * (b - a)
             fd = negative_log_likelihood(confidences, correct, d)
     return (a + b) / 2.0
+
+
+def fit_calibrator(
+    confidences: Sequence[float],
+    correct: Sequence[bool],
+    *,
+    version: str,
+    holdout_every: int = 4,
+) -> Calibrator:
+    """Fit a :class:`~sentinel.confidence.Calibrator` and measure it on held-out cases.
+
+    Every ``holdout_every``-th case (deterministic, so a refit is reproducible) is
+    held out; ``T`` is fit on the rest by NLL (§6.3), then the ECE of the calibrated
+    held-out confidences is recorded as ``holdout_ece``. ``fitted_on`` is the number
+    of labelled cases behind the map. :meth:`Calibrator.trusted_for_autonomy` reads
+    both.
+    """
+    _validate(confidences, correct)
+    if holdout_every < 2:
+        raise ValueError(f"holdout_every must be >= 2: {holdout_every}")
+    held = [i for i in range(len(confidences)) if i % holdout_every == 0]
+    train = [i for i in range(len(confidences)) if i % holdout_every != 0]
+    if len(held) < 1 or len(train) < 2:
+        raise ValueError(f"too few labelled cases to fit and hold out: {len(confidences)}")
+    temperature = fit_temperature([confidences[i] for i in train], [correct[i] for i in train])
+    draft = Calibrator(temperature, version)
+    holdout_ece = expected_calibration_error(
+        [draft.apply(confidences[i]) for i in held], [correct[i] for i in held]
+    )
+    return Calibrator(
+        temperature, version, fitted_on=len(confidences), holdout_ece=holdout_ece
+    )

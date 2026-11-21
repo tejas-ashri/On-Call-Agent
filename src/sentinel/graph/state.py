@@ -52,6 +52,7 @@ class IncidentGraphState(TypedDict, total=False):
     assessment: ConfidenceAssessment | None
     decision: EscalationDecision | None
     plan: RemediationPlan | None
+    action_id: str | None  # deterministic id of executing ``plan`` (see orchestrator.ledger)
     page_payload: PagePayload | None
     action_result: ActionResult | None
     approval: bool | None
@@ -74,6 +75,7 @@ def initial_state(
         assessment=None,
         decision=None,
         plan=None,
+        action_id=None,
         page_payload=None,
         action_result=None,
         approval=None,

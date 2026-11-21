@@ -2,8 +2,9 @@
 
 A versioned, replayable corpus of incidents, **stratified by stack archetype** (§2.1) so
 the evals don't overfit to one provider's signal shape. Each YAML case
-(``golden/<archetype>/<name>.yaml``) carries the redacted ``SpecialistFinding``s a correct
-diagnosis produced, plus the graded ``expected`` ground truth — notably
+(``golden/<archetype>/<name>.yaml``) carries the raw ``observations`` the specialists'
+tools serve, the redacted ``SpecialistFinding``s a correct diagnosis produced, plus the
+graded ``expected`` ground truth — notably
 ``expected_outcome_by_grant``, which lets a single case test the entire §00.6 escalation
 matrix (§2.2). The corpus is the substrate for the L1 evals
 (``tests/test_golden_eval.py``) and, later, the calibration/ECE measurement (doc 06 §6).
@@ -22,7 +23,12 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from sentinel.contracts.agents import EscalationOutcome, SpecialistFinding, SpecialistRole
+from sentinel.contracts.agents import (
+    EscalationOutcome,
+    EvidenceRef,
+    SpecialistFinding,
+    SpecialistRole,
+)
 from sentinel.enums import AutonomyTier, ConfidenceBand
 
 Archetype = Literal["edge_db", "container_pg", "jamstack", "error_led", "uptime_led"]
@@ -73,6 +79,10 @@ class GoldenCase(BaseModel):
     incident_id: str
     stack: GoldenStack
     title: str
+    # The raw telemetry, kept apart from ``findings`` (the answers): every observation
+    # a finding cites, plus distractors — irrelevant or misleading signals of the same
+    # kinds. Investigations replay these, so an eval cannot pass by echoing the key.
+    observations: list[EvidenceRef] = Field(min_length=1)
     findings: list[SpecialistFinding]
     expected: GoldenExpectation
     labels: list[str] = Field(default_factory=list)

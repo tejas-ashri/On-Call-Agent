@@ -25,6 +25,7 @@ from sentinel.connectors import (
     idempotency_key,
 )
 from sentinel.contracts import ActionRequest, CanonicalEvent
+from sentinel.correlator import correlate
 from sentinel.enums import (
     ActionStatus,
     ActionType,
@@ -194,6 +195,63 @@ def test_sentry_level_severity_map() -> None:
         }
         ev = asyncio.run(conn.normalize(_raw("sentry", payload), _ctx("sentry")))[0]
         assert ev.severity is expected
+
+
+_FULL_SHA = "9fceb02d0ae598e95dc970b74767f19372d61af8"
+
+
+@pytest.mark.parametrize(
+    ("release", "commit_sha"),
+    [
+        ("web@2026.6.12-a1b2c3d", "a1b2c3d"),
+        ("A1B2C3D4E5F6", "a1b2c3d4e5f6"),
+        (f"web@{_FULL_SHA}", _FULL_SHA),
+        ("web@1.4.2", None),
+        ("20260612", None),  # all digits: a build number, not a commit
+        ("abc12", None),  # shorter than an abbreviated SHA
+    ],
+)
+def test_sentry_release_yields_commit_sha_join_key(release: str, commit_sha: str | None) -> None:
+    payload: dict[str, object] = {
+        "data": {
+            "event": {"issue_id": "1", "title": "t", "timestamp": 1749816000.0, "release": release}
+        }
+    }
+    ev = asyncio.run(SentryConnector().normalize(_raw("sentry", payload), _ctx("sentry")))[0]
+    assert ev.labels["release"] == release
+    assert ev.labels.get("commit_sha") == commit_sha
+
+
+def test_connectors_stamp_the_integrations_configured_service() -> None:
+    ctx = _ctx("sentry").model_copy(update={"config": {"service": "svc_web"}})
+    sentry = asyncio.run(SentryConnector().normalize(_raw("sentry", SENTRY_PAYLOAD), ctx))[0]
+    vercel = asyncio.run(VercelConnector().normalize(_raw("vercel", VERCEL_PAYLOAD), ctx))[0]
+    assert sentry.service == vercel.service == "svc_web"
+    # unconfigured → null, which never joins on its own
+    bare = asyncio.run(SentryConnector().normalize(_raw("sentry", SENTRY_PAYLOAD), _ctx("sentry")))
+    assert bare[0].service is None
+
+
+def test_sentry_error_and_vercel_deploy_correlate_into_one_incident() -> None:
+    # The real payloads share no fingerprint or service; only the commit joins them —
+    # Vercel's full SHA against the short SHA in Sentry's release.
+    vercel_payload = {
+        **VERCEL_PAYLOAD,
+        "payload": {
+            **VERCEL_PAYLOAD["payload"],  # type: ignore[dict-item]
+            "deployment": {
+                "id": "dpl_8Kd2...",
+                "name": "acme-web",
+                "meta": {"githubCommitSha": "A1B2C3D9E8F7A6B5C4D3E2F1A0B9C8D7E6F5A4B3"},
+            },
+        },
+    }
+    sentry_raw, vercel_raw = _raw("sentry", SENTRY_PAYLOAD), _raw("vercel", vercel_payload)
+    sentry = asyncio.run(SentryConnector().normalize(sentry_raw, _ctx("sentry")))
+    vercel = asyncio.run(VercelConnector().normalize(vercel_raw, _ctx("vercel")))
+    drafts = correlate([*sentry, *vercel], window_seconds=600.0)
+    assert len(drafts) == 1
+    assert len(drafts[0].event_ids) == 2
 
 
 def test_sentry_is_read_only() -> None:

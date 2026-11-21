@@ -29,6 +29,7 @@ from sentinel.connectors.base import IntegrationContext, RawSignal, webhook_sign
 from sentinel.connectors.sentry import SentryConnector
 from sentinel.contracts import (
     AutonomyGrant,
+    CanonicalEvent,
     ConfidenceAssessment,
     EscalationDecision,
     EvidenceRef,
@@ -53,6 +54,7 @@ from sentinel.enums import (
     IntegrationMethod,
 )
 from sentinel.graph import IncidentGraphState, build_incident_graph
+from sentinel.incidents import InMemoryIncidentRegistry
 from sentinel.notify import render_page
 from sentinel.orchestrator import (
     ActionExecutor,
@@ -111,7 +113,9 @@ class _Planner:
     def __init__(self, plan: RemediationPlan) -> None:
         self._plan = plan
 
-    async def draft(self, incident_id: str, hypothesis: Hypothesis) -> RemediationPlan:
+    async def draft(
+        self, incident_id: str, hypothesis: Hypothesis, events: Sequence[CanonicalEvent]
+    ) -> RemediationPlan:
         return self._plan
 
 
@@ -120,7 +124,7 @@ class _Executor:
         self.acted = False
 
     async def execute(
-        self, plan: RemediationPlan, *, tenant_id: str, incident_id: str
+        self, plan: RemediationPlan, *, tenant_id: str, incident_id: str, action_id: str
     ) -> ActionResult:
         self.acted = True
         return ActionResult(action_id="act_demo", status=ActionStatus.SUCCEEDED)
@@ -214,9 +218,12 @@ def _build_graph(
         commander=commander,
         planner=planner,
         executor=executor,
-        grant=grant,
+        grants=[grant],
         calibrator=Calibrator(temperature=1.0, version="cal.demo"),
         clock=lambda: _T,
+        # The demo has no fitted calibrator; lift the T3 cap so scenario A can show
+        # the autonomous path. Production keeps it on.
+        require_calibrated_autonomy=False,
     )
 
 
@@ -268,11 +275,16 @@ async def run_demo(*, sink: Callable[[str], None] = print) -> dict[str, Incident
     app_a = _build_graph(
         grant=_grant(AutonomyTier.T3), hypotheses=[_hypothesis()], executor=executor
     )
-    state_a = (
+    result_a = (
         await run_incident_pipeline(
-            events=events, app=app_a, window_seconds=300.0, new_incident_id=lambda: "inc_demo_a"
+            events=events,
+            app=app_a,
+            registry=InMemoryIncidentRegistry(),
+            window_seconds=300.0,
+            new_incident_id=lambda: "inc_demo_a",
         )
     )[0]
+    state_a = cast(dict[str, object], result_a.state)
     _print_investigation(sink, "Scenario A — T3 autonomous", state_a)
     outcomes["autonomous"] = cast(IncidentState, state_a["final_state"])
 
@@ -287,11 +299,16 @@ async def run_demo(*, sink: Callable[[str], None] = print) -> dict[str, Incident
         ],
         executor=_Executor(),
     )
-    state_b = (
+    result_b = (
         await run_incident_pipeline(
-            events=events, app=app_b, window_seconds=300.0, new_incident_id=lambda: "inc_demo_b"
+            events=events,
+            app=app_b,
+            registry=InMemoryIncidentRegistry(),
+            window_seconds=300.0,
+            new_incident_id=lambda: "inc_demo_b",
         )
     )[0]
+    state_b = cast(dict[str, object], result_b.state)
     _print_investigation(sink, "Scenario B — T1 page-with-fix", state_b)
     page = state_b.get("page_payload")
     if page is not None:

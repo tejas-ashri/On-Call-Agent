@@ -91,6 +91,8 @@ class IntegrationContext(BaseModel):
     integration_id: str
     provider: str
     vault_ref: str
+    # Per-integration settings. ``service`` names the svc_ this integration reports
+    # for; connectors stamp it on every event so the correlator can join on service.
     config: dict[str, str] = Field(default_factory=dict)
 
 

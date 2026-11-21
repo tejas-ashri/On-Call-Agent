@@ -47,6 +47,33 @@ findings:
         summary: "trace shows 43 sequential SELECTs on orders.items per request"
         observed_at: "2026-05-02T14:07:10Z"
         raw_ref: "obj://redacted/trc_orders_0007"
+observations:
+  # The raw telemetry the specialists' tools serve. Kept apart from `findings` (the
+  # answers) and padded with distractors, so an eval cannot pass by echoing the key.
+  - kind: deploy
+    summary: "Vercel deployment abc123 promoted to production at 14:05Z"
+    observed_at: "2026-05-02T14:05:00Z"
+    raw_ref: "obj://redacted/dep_abc123"
+  - kind: deploy
+    summary: "Vercel preview deployment f00d421 for branch docs-typo (not promoted)"
+    observed_at: "2026-05-02T13:52:00Z"
+    raw_ref: "obj://redacted/dep_f00d421"
+  - kind: metric
+    summary: "pg pool active 12→60 within 90s of the deploy"
+    observed_at: "2026-05-02T14:06:30Z"
+    raw_ref: "obj://redacted/met_pool_0007"
+  - kind: metric
+    summary: "edge CPU steady at 22-25%, no change across the window"
+    observed_at: "2026-05-02T14:06:00Z"
+    raw_ref: "obj://redacted/met_cpu_0007"
+  - kind: trace
+    summary: "trace shows 43 sequential SELECTs on orders.items per request"
+    observed_at: "2026-05-02T14:07:10Z"
+    raw_ref: "obj://redacted/trc_orders_0007"
+  - kind: log
+    summary: "image CDN returned 3 slow responses (>2s) for /static/hero.webp"
+    observed_at: "2026-05-02T14:04:10Z"
+    raw_ref: "obj://redacted/log_cdn_0007"
 expected:
   root_cause_class: "deploy_regression.db_pool_exhaustion"
   primary_service_kind: "db"

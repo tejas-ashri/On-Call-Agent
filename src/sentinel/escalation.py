@@ -14,6 +14,7 @@ amount of granted autonomy can override them.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -35,8 +36,53 @@ class PolicyInputs:
     n_competing: int = 0  # rival hypotheses within margin (for the rationale)
 
 
+#: ``(tenant_id, action_type) → the grant covering it, or None``. Production backs
+#: it with the ``autonomy_grants`` table so a revocation takes effect immediately.
+GrantLookup = Callable[[str, str], AutonomyGrant | None]
+
+_TIER_RANK = {tier: rank for rank, tier in enumerate(AutonomyTier)}
+
+
+def grant_lookup(grants: Iterable[AutonomyGrant]) -> GrantLookup:
+    """A :data:`GrantLookup` over a fixed set of grants.
+
+    A tenant holds one grant per action type, so a tenant that allowed both
+    ``deploy.rollback`` and ``process.restart`` gets each one's own tier. If
+    several grants cover the same pair, an active one wins over a revoked one, and
+    among active ones the lowest tier wins (fail safe, C1).
+    """
+    table: dict[tuple[str, str], list[AutonomyGrant]] = {}
+    for g in grants:
+        table.setdefault((g.tenant_id, g.action_type.value), []).append(g)
+
+    def lookup(tenant_id: str, action_type: str) -> AutonomyGrant | None:
+        candidates = table.get((tenant_id, action_type))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda g: (not g.active, _TIER_RANK[g.max_tier]))
+
+    return lookup
+
+
+def as_grant_lookup(grants: GrantLookup | Iterable[AutonomyGrant]) -> GrantLookup:
+    """Accept either a live lookup or a fixed collection of grants."""
+    return grants if callable(grants) else grant_lookup(grants)
+
+
+def resolve_grant(
+    grants: GrantLookup, *, tenant_id: str, action_type: str
+) -> AutonomyGrant | None:
+    """The grant for one decision; an unreadable grant store confers nothing."""
+    if not action_type:
+        return None
+    try:
+        return grants(tenant_id, action_type)
+    except Exception:
+        return None
+
+
 def effective_tier(
-    grant: AutonomyGrant,
+    grant: AutonomyGrant | None,
     *,
     tenant_id: str,
     action_type: str,
@@ -45,14 +91,15 @@ def effective_tier(
     """The tier ``grant`` actually confers on one ``(tenant, action_type)`` decision.
 
     A grant is scoped to exactly one tenant and one action type (doc 00 §5.2), so
-    it confers nothing — ``T0`` — when it is revoked, belongs to another tenant,
-    or covers a different action. An open cost breaker also degrades to ``T0``
+    it confers nothing — ``T0`` — when there is none, it is revoked, belongs to
+    another tenant, or covers a different action. An open cost breaker also degrades to ``T0``
     (doc 07 §5, ADR-010). Grant ``constraints`` are not yet evaluated here, so a
     constrained grant is capped at ``T2``: it may still execute, but only after a
     human approves (fail safe, C1).
     """
     if (
         breaker_open
+        or grant is None
         or not grant.active
         or grant.tenant_id != tenant_id
         or grant.action_type != action_type

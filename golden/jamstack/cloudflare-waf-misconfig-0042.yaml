@@ -37,6 +37,27 @@ findings:
         summary: "/api/* 403 rate 0→100% at 11:15, ruleId present in WAF log"
         observed_at: "2026-05-28T11:16:00Z"
         raw_ref: "obj://redacted/log_waf_0042"
+observations:
+  - kind: deploy
+    summary: "Cloudflare ruleset update event at 11:15Z"
+    observed_at: "2026-05-28T11:15:00Z"
+    raw_ref: "obj://redacted/cfg_waf_0042"
+  - kind: deploy
+    summary: "Pages deployment of marketing site at 10:02Z (static assets only)"
+    observed_at: "2026-05-28T10:02:00Z"
+    raw_ref: "obj://redacted/dep_pages_0042"
+  - kind: log
+    summary: "/api/* 403 rate 0→100% at 11:15, ruleId present in WAF log"
+    observed_at: "2026-05-28T11:16:00Z"
+    raw_ref: "obj://redacted/log_waf_0042"
+  - kind: log
+    summary: "origin health checks passing every 30s"
+    observed_at: "2026-05-28T11:16:30Z"
+    raw_ref: "obj://redacted/log_health_0042"
+  - kind: metric
+    summary: "origin request volume dropped 95% at 11:15"
+    observed_at: "2026-05-28T11:16:00Z"
+    raw_ref: "obj://redacted/met_origin_0042"
 expected:
   root_cause_class: "config_change.waf_overblock"
   primary_service_kind: "edge"

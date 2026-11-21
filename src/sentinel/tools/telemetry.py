@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from sentinel.contracts import EvidenceRef, SpecialistFinding
+from sentinel.contracts import EvidenceRef
 from sentinel.orchestrator import InvestigationContext
 
 if TYPE_CHECKING:
@@ -60,11 +60,13 @@ class TelemetrySource(Protocol):
 class GoldenTelemetry:
     """Replays a golden case's recorded observations, filtered per evidence kind.
 
-    Only the raw observations are exposed — never a finding's ``summary`` or
-    ``suspected_cause``, which are the answers the specialist must reach itself.
+    Serves the case's ``observations`` — relevant and distractor alike — never its
+    ``findings``: a finding's ``summary`` and ``suspected_cause`` are the answers the
+    specialist must reach itself, and serving only the evidence that supports them
+    would hand it the conclusion.
     """
 
-    def __init__(self, findings: Sequence[SpecialistFinding]) -> None:
+    def __init__(self, observations: Sequence[EvidenceRef]) -> None:
         self._observations = sorted(
             (
                 Observation(
@@ -74,15 +76,14 @@ class GoldenTelemetry:
                     raw_ref=ev.raw_ref,
                     event_id=ev.event_id,
                 )
-                for f in findings
-                for ev in f.evidence
+                for ev in observations
             ),
             key=lambda o: o.observed_at,
         )
 
     @classmethod
     def from_case(cls, case: GoldenCase) -> GoldenTelemetry:
-        return cls(case.findings)
+        return cls(case.observations)
 
     async def fetch(
         self, kind: EvidenceKind, ctx: InvestigationContext, *, contains: str | None = None

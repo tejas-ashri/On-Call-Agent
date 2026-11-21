@@ -109,7 +109,7 @@ class VercelConnector(ConnectorBase):
             labels["deployment.url"] = str(url)
         # THE keystone cross-provider join key (doc 03 §6.2).
         if (commit_sha := meta.get("githubCommitSha")) is not None:
-            labels["commit_sha"] = str(commit_sha)
+            labels["commit_sha"] = str(commit_sha).lower()
         if (commit_ref := meta.get("githubCommitRef")) is not None:
             labels["commit_ref"] = str(commit_ref)
 
@@ -123,7 +123,8 @@ class VercelConnector(ConnectorBase):
                 integration_id=ctx.integration_id,
                 source="vercel",
                 kind=EventKind.DEPLOY,  # constant (doc 03 §6.2)
-                service=None,  # prj_+target -> svc_ via discovery (doc 02)
+                # the service this integration is bound to; null if unconfigured (doc 02)
+                service=ctx.config.get("service"),
                 severity=_TYPE_TO_SEVERITY.get(typ, Severity.INFO),
                 title=title,
                 body_redacted="",  # the edge fills it (ADR-004, doc 05)

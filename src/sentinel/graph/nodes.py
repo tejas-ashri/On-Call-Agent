@@ -26,19 +26,26 @@ from sentinel.confidence import (
     build_assessment,
     independent_corroboration,
 )
-from sentinel.contracts import AutonomyGrant, Hypothesis, PagePayload, RemediationPlan
-from sentinel.enums import ActionStatus, ActionType, IncidentState
-from sentinel.escalation import PolicyInputs, decide_escalation, effective_tier
+from sentinel.contracts import Hypothesis, PagePayload, RemediationPlan
+from sentinel.enums import ActionStatus, ActionType, AutonomyTier, IncidentState
+from sentinel.escalation import (
+    GrantLookup,
+    PolicyInputs,
+    decide_escalation,
+    effective_tier,
+    resolve_grant,
+)
 from sentinel.graph.state import IncidentGraphState
 from sentinel.incidents.events import IncidentEvent, IncidentEventType
 from sentinel.notify import Notifier
 from sentinel.orchestrator.guard import (
+    execute_once,
     no_plan_decision,
     safe_draft,
-    safe_execute,
     safe_investigate,
     safe_synthesize,
 )
+from sentinel.orchestrator.ledger import ActionLedger, action_id_for
 from sentinel.orchestrator.protocols import (
     ActionExecutor,
     Commander,
@@ -59,6 +66,8 @@ _ROLE_ORDER: dict[str, int] = {
 }
 
 Node = Callable[[IncidentGraphState], Awaitable[dict[str, object]]]
+
+_TIER_RANK = {tier: rank for rank, tier in enumerate(AutonomyTier)}
 
 
 class AuditSink(Protocol):
@@ -83,7 +92,8 @@ class _Deps:
     commander: Commander
     planner: Planner
     executor: ActionExecutor
-    grant: AutonomyGrant
+    grants: GrantLookup
+    ledger: ActionLedger
     calibrator: Calibrator
     competing_margin: float
     clock: Callable[[], datetime]
@@ -91,6 +101,40 @@ class _Deps:
     cost_breaker_open: Callable[[str], bool] | None = None
     approval_ttl: timedelta | None = None
     audit: AuditSink | None = None
+    approvers: Callable[[str, str], bool] | None = None
+    # False unless the calibrator is fitted and validated (see Calibrator.trusted_for_autonomy):
+    # until then a HIGH band is not evidence enough to act without a human.
+    autonomy_calibrated: bool = False
+
+    def tier_for(self, tenant_id: str, action_type: str) -> tuple[AutonomyTier, str | None]:
+        """The effective tier for one decision, and the id of the grant behind it.
+
+        T3 is capped at T2 (act only after approval) while the calibrator is not
+        trusted for autonomy.
+        """
+        grant = resolve_grant(self.grants, tenant_id=tenant_id, action_type=action_type)
+        tier = effective_tier(
+            grant,
+            tenant_id=tenant_id,
+            action_type=action_type,
+            breaker_open=self.breaker_open(tenant_id),
+        )
+        if tier is AutonomyTier.T3 and not self.autonomy_calibrated:
+            tier = AutonomyTier.T2
+        return tier, grant.grant_id if grant is not None else None
+
+    def approver_allowed(self, tenant_id: str, approver: str) -> bool:
+        """Whether ``approver`` may approve actions for the tenant.
+
+        With no approver directory configured nobody can — an approval nobody can
+        attribute must not move prod (fail closed, C1). A failing directory denies.
+        """
+        if self.approvers is None:
+            return False
+        try:
+            return bool(self.approvers(tenant_id, approver))
+        except Exception:
+            return False
 
     def breaker_open(self, tenant_id: str) -> bool:
         """Whether the tenant's cost breaker is open; an unreadable breaker counts as open."""
@@ -157,7 +201,11 @@ class _Emitter:
 
 
 def _build_page(
-    state: IncidentGraphState, top: Hypothesis, plan: RemediationPlan | None, outcome: str
+    state: IncidentGraphState,
+    top: Hypothesis,
+    plan: RemediationPlan | None,
+    outcome: str,
+    one_tap_action_id: str | None = None,
 ) -> PagePayload:
     """The doc 00 §6 page contract: root cause, evidence chain, rivals, drafted fix."""
     assessment = state["assessment"]
@@ -171,22 +219,31 @@ def _build_page(
         evidence_chain=evidence_chain,
         competing_hypotheses=list(state["hypotheses"][1:]),
         drafted_remediation=plan,
+        one_tap_action_id=one_tap_action_id,
         outcome=outcome,
     )
 
 
-def _parse_approval(payload: object) -> tuple[bool, str | None]:
-    """Interpret the human's resume value: ``(approved, approver)``.
+def _parse_approval(payload: object, action_id: str) -> tuple[str | None, str | None]:
+    """Interpret the human's resume value: ``(approver, denial_reason)``.
 
-    Only a literal ``True`` (or ``{"approved": True}``) approves — anything else,
-    including ``"false"``, ``"no"`` or ``1``, is a denial (fail closed, C1).
+    An approval is ``{"approved": True, "action_id": <the page's one_tap_action_id>,
+    "approver": <who>}``. Anything else denies (fail closed, C1): a bare ``True``,
+    ``"yes"`` or ``1``; an approval of a *different* action (stale or replayed tap);
+    or one that names no approver. Authorization of the approver is checked by the
+    caller.
     """
-    if payload is True:
-        return True, None
-    if isinstance(payload, dict) and payload.get("approved") is True:
-        approver = payload.get("approver")
-        return True, approver if isinstance(approver, str) and approver else None
-    return False, None
+    if not isinstance(payload, dict):
+        return None, "denied"
+    approver = payload.get("approver")
+    approver = approver if isinstance(approver, str) and approver else None
+    if payload.get("approved") is not True:
+        return approver, "denied"
+    if payload.get("action_id") != action_id:
+        return approver, "action_mismatch"
+    if approver is None:
+        return None, "no_approver"
+    return approver, None
 
 
 def make_intake(deps: _Deps) -> Node:
@@ -277,17 +334,15 @@ def make_plan_and_decide(deps: _Deps) -> Node:
         em = _Emitter(state, deps.clock)
         draft = state["draft"]
         top = state["hypotheses"][0]
-        plan = await safe_draft(deps.planner, draft.incident_id, top)
+        plan = await safe_draft(deps.planner, draft.incident_id, top, state["signal_events"])
         assessment = state["assessment"]
         assert assessment is not None
-        # The grant only applies to its own tenant and action type, while active and
-        # while the tenant is under its cost ceiling; otherwise it confers T0.
-        tier = effective_tier(
-            deps.grant,
-            tenant_id=draft.tenant_id,
-            action_type=plan.action_type if plan is not None else "",
-            breaker_open=deps.breaker_open(draft.tenant_id),
+        # The tenant's grant for *this* action type applies while active and while the
+        # tenant is under its cost ceiling; no grant (or no plan) confers T0.
+        tier, grant_id = deps.tier_for(
+            draft.tenant_id, plan.action_type if plan is not None else ""
         )
+        action_id = action_id_for(draft.incident_id, plan) if plan is not None else None
         if plan is None:
             decision = no_plan_decision(draft.incident_id, assessment, tier)
         else:
@@ -313,15 +368,18 @@ def make_plan_and_decide(deps: _Deps) -> Node:
             {
                 "outcome": decision.outcome,
                 "granted_tier": tier.value,
-                "grant_id": deps.grant.grant_id,
+                "grant_id": grant_id,
                 "action_type": plan.action_type if plan is not None else None,
+                "action_id": action_id,
             },
         )
         if decision.outcome == "act_and_report":
-            return {"plan": plan, "decision": decision}  # → act
+            return {"plan": plan, "decision": decision, "action_id": action_id}  # → act
 
-        page = _build_page(state, top, plan, decision.outcome)
-        if decision.target_state == "AWAITING_APPROVAL":
+        awaiting = decision.target_state == "AWAITING_APPROVAL"
+        # The one-tap token is the action id: an approval must echo it (see await_approval).
+        page = _build_page(state, top, plan, decision.outcome, action_id if awaiting else None)
+        if awaiting:
             # APPROVAL_REQUESTED is emitted *here* (runs once, before the suspend),
             # so projecting the log while paused already reads AWAITING_APPROVAL.
             em.emit(IncidentEventType.APPROVAL_REQUESTED, "commander")
@@ -329,13 +387,18 @@ def make_plan_and_decide(deps: _Deps) -> Node:
             return em.update(
                 plan=plan,
                 decision=decision,
+                action_id=action_id,
                 page_payload=page,
                 approval_requested_at=deps.clock(),
             )
         em.emit(IncidentEventType.INCIDENT_ESCALATED, "commander", {"outcome": decision.outcome})
         await deps.notify(page)
         return em.update(
-            plan=plan, decision=decision, page_payload=page, final_state=IncidentState.ESCALATED
+            plan=plan,
+            decision=decision,
+            action_id=action_id,
+            page_payload=page,
+            final_state=IncidentState.ESCALATED,
         )
 
     return plan_and_decide
@@ -344,34 +407,43 @@ def make_plan_and_decide(deps: _Deps) -> Node:
 def make_await_approval(deps: _Deps) -> Node:
     async def await_approval(state: IncidentGraphState) -> dict[str, object]:
         plan = state["plan"]
-        assert plan is not None
+        action_id = state.get("action_id")
+        assert plan is not None and action_id is not None
+        tenant_id = state["draft"].tenant_id
         # SUSPEND. interrupt() is the first effect in this node: on resume LangGraph
         # re-runs the node from the top, so nothing emitted before it may run twice.
         payload = interrupt(
             {
                 "reason": "approval_required",
                 "incident_id": state["draft"].incident_id,
+                "action_id": action_id,
                 "action_type": plan.action_type,
                 "target": plan.target,
             }
         )
         em = _Emitter(state, deps.clock)
-        approved, approver = _parse_approval(payload)
+        approver, reason = _parse_approval(payload, action_id)
+        if reason is None and approver is not None and not deps.approver_allowed(
+            tenant_id, approver
+        ):
+            reason = "unauthorized_approver"
         requested_at = state.get("approval_requested_at")
-        expired = (
-            deps.approval_ttl is not None
+        if (
+            reason is None
+            and deps.approval_ttl is not None
             and requested_at is not None
             and deps.clock() - requested_at > deps.approval_ttl
-        )
+        ):
+            reason = "expired"
         actor = f"human:{approver}" if approver else "human"
-        if approved and not expired:
-            detail: dict[str, object] = {"approver": approver} if approver else {}
-            em.emit(IncidentEventType.APPROVAL_GRANTED, actor, detail)
-            deps.record(state, actor, "approval.granted", plan.target, {})
+        if reason is None:
+            em.emit(IncidentEventType.APPROVAL_GRANTED, actor, {"approver": approver})
+            deps.record(state, actor, "approval.granted", plan.target, {"action_id": action_id})
             return em.update(approval=True)  # → act
-        reason = "expired" if approved else "denied"
         em.emit(IncidentEventType.APPROVAL_DENIED, actor, {"reason": reason})
-        deps.record(state, actor, "approval.denied", plan.target, {"reason": reason})
+        deps.record(
+            state, actor, "approval.denied", plan.target, {"reason": reason, "action_id": action_id}
+        )
         return em.update(approval=False, final_state=IncidentState.ESCALATED)
 
     return await_approval
@@ -383,25 +455,43 @@ def make_act(deps: _Deps) -> Node:
         draft = state["draft"]
         plan = state["plan"]
         decision = state["decision"]
-        assert plan is not None and decision is not None
-        # Re-checked here: spend may have crossed the ceiling while awaiting approval.
-        if deps.breaker_open(draft.tenant_id):
-            em.emit(
-                IncidentEventType.INCIDENT_ESCALATED, "commander", {"reason": "cost_breaker_open"}
-            )
+        action_id = state.get("action_id")
+        assert plan is not None and decision is not None and action_id is not None
+        # Re-checked here: while awaiting approval, spend may have crossed the ceiling
+        # or the tenant may have revoked or lowered the grant.
+        tier, _ = deps.tier_for(draft.tenant_id, plan.action_type)
+        required = AutonomyTier.T3 if decision.outcome == "act_and_report" else AutonomyTier.T2
+        blocked = (
+            "cost_breaker_open"
+            if deps.breaker_open(draft.tenant_id)
+            else "grant_no_longer_permits"
+            if _TIER_RANK[tier] < _TIER_RANK[required]
+            else None
+        )
+        if blocked is not None:
+            em.emit(IncidentEventType.INCIDENT_ESCALATED, "commander", {"reason": blocked})
             page = _build_page(state, state["hypotheses"][0], plan, decision.outcome)
             await deps.notify(page)
             return em.update(page_payload=page, final_state=IncidentState.ESCALATED)
         em.emit(IncidentEventType.REMEDIATION_STARTED, "planner")
-        result = await safe_execute(
-            deps.executor, plan, tenant_id=draft.tenant_id, incident_id=draft.incident_id
+        result = await execute_once(
+            deps.executor,
+            deps.ledger,
+            plan,
+            tenant_id=draft.tenant_id,
+            incident_id=draft.incident_id,
+            action_id=action_id,
         )
         deps.record(
             state,
             "planner",
             "action.executed",
             plan.target,
-            {"action_type": plan.action_type, "status": result.status.value},
+            {
+                "action_type": plan.action_type,
+                "action_id": action_id,
+                "status": result.status.value,
+            },
         )
         em.emit(IncidentEventType.MONITORING_STARTED, "commander")
         if result.status is ActionStatus.SUCCEEDED and not result.rolled_back:

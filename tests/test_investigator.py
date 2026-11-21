@@ -106,8 +106,10 @@ def test_every_role_gets_exactly_its_own_tool() -> None:
 def test_golden_telemetry_filters_by_kind_and_hides_the_answers() -> None:
     case = _case("gold_0007")
     deploys = asyncio.run(GoldenTelemetry.from_case(case).fetch("deploy", _ctx()))
+    # the cited deploy and an unrelated preview deploy (a distractor), in time order
     assert [o.summary for o in deploys] == [
-        "Vercel deployment abc123 promoted to production at 14:05Z"
+        "Vercel preview deployment f00d421 for branch docs-typo (not promoted)",
+        "Vercel deployment abc123 promoted to production at 14:05Z",
     ]
     # The finding's conclusion is never served — only its raw observation.
     finding = next(f for f in case.findings if f.role == "change_deploy")
@@ -124,7 +126,8 @@ def test_contains_filter_is_case_insensitive() -> None:
 
 
 def test_specialist_investigates_and_cites_returned_evidence() -> None:
-    model = _scripted(_call("list_recent_deploys"), _answer("deploy abc123", ["obs_1"]))
+    # obs_1 is the distractor preview deploy; obs_2 is the promoted one.
+    model = _scripted(_call("list_recent_deploys"), _answer("deploy abc123", ["obs_2"]))
     finding = asyncio.run(_investigator("change_deploy", model).investigate(_ctx()))
 
     assert finding.status == "ok"
@@ -223,13 +226,18 @@ def test_all_five_investigators_restore_independent_corroboration() -> None:
     findings = asyncio.run(_investigate_all(model))
 
     by_role = {f.role: f for f in findings}
-    # gold_0007 recorded deploy, metric and trace data; log and error have none.
-    assert {r for r, f in by_role.items() if f.evidence} == {"change_deploy", "metric", "trace"}
-    assert by_role["log"].status == by_role["error"].status == "no_signal"
+    # gold_0007 recorded deploy, metric, trace and (distractor) log data; no errors.
+    assert {r for r, f in by_role.items() if f.evidence} == {
+        "change_deploy",
+        "log",
+        "metric",
+        "trace",
+    }
+    assert by_role["error"].status == "no_signal"
 
     [top] = asyncio.run(_commander_supporting(findings).synthesize("inc_1", findings))
-    assert sorted(top.supporting_roles) == ["change_deploy", "metric", "trace"]
-    assert independent_corroboration(top, findings) == 3
+    assert sorted(top.supporting_roles) == ["change_deploy", "log", "metric", "trace"]
+    assert independent_corroboration(top, findings) == 4
 
 
 def test_single_call_specialists_agreeing_still_count_once() -> None:
@@ -287,8 +295,8 @@ def test_to_messages_renders_a_tool_round_trip() -> None:
 def test_build_llm_agents_wires_investigators_only_with_telemetry() -> None:
     settings = Settings(anthropic_api_key="sk-test", llm_model="claude-haiku-4-5", use_llm=True)
     meter = TokenMeter(sink=lambda _: None)
-    plain, _ = build_llm_agents(settings=settings, meter=meter, roles=_ROLES)
-    tooled, _ = build_llm_agents(
+    plain, _, _ = build_llm_agents(settings=settings, meter=meter, roles=_ROLES)
+    tooled, _, _ = build_llm_agents(
         settings=settings, meter=meter, roles=_ROLES, telemetry=GoldenTelemetry([])
     )
     assert all(isinstance(s, LLMSpecialist) for s in plain)

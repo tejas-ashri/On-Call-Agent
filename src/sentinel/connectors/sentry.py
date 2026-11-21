@@ -11,6 +11,7 @@ correlation key for the Change/Deploy specialist, doc 04).
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import UTC, datetime
 
 from sentinel.connectors.base import (
@@ -33,6 +34,17 @@ _LEVEL_TO_SEVERITY: dict[str, Severity] = {
     "info": Severity.INFO,
     "debug": Severity.DEBUG,
 }
+
+# A git SHA (short or full) ending a release string: ``a1b2c3d``, ``web@<sha>``,
+# ``web@2026.6.12-a1b2c3d``. It must contain a letter so date- or build-number-only
+# versions (``20260612``) are not mistaken for a commit.
+_RELEASE_SHA = re.compile(r"(?:^|[@\-+_.])(?=[0-9]*[a-f])([0-9a-f]{7,40})$", re.IGNORECASE)
+
+
+def _commit_from_release(release: str) -> str | None:
+    """The commit SHA a Sentry ``release`` names, if any (the cross-provider join key)."""
+    match = _RELEASE_SHA.search(release.strip())
+    return match.group(1).lower() if match else None
 
 
 class SentryConnector(ConnectorBase):
@@ -73,6 +85,10 @@ class SentryConnector(ConnectorBase):
         # Sentry's own event id is retained as a label (doc 03 §6.1).
         if (sentry_event_id := event.get("event_id")) is not None:
             labels["sentry.event_id"] = str(sentry_event_id)
+        # The release usually names the deployed commit; exposing it as ``commit_sha``
+        # lets the correlator join this error to the Vercel deploy that shipped it.
+        if "release" in labels and (commit_sha := _commit_from_release(labels["release"])):
+            labels["commit_sha"] = commit_sha
 
         # issue alerts with no exception -> "alert"; exceptions -> "error" (§6.1).
         kind = EventKind.ERROR if has_exception else EventKind.ALERT
@@ -86,7 +102,8 @@ class SentryConnector(ConnectorBase):
                 integration_id=ctx.integration_id,
                 source="sentry",
                 kind=kind,
-                service=None,  # resolved to svc_ by discovery (doc 02); else null
+                # the service this integration is bound to; null if unconfigured (doc 02)
+                service=ctx.config.get("service"),
                 severity=_LEVEL_TO_SEVERITY.get(level, Severity.ERROR),
                 title=str(event.get("title", "")),
                 body_redacted="",  # the edge fills it (ADR-004, doc 05)

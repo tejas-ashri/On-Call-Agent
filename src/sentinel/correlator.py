@@ -13,9 +13,10 @@ Grouping rules (per doc 01 §5, doc 03 §6.2):
 * **Time window.** Two same-tenant events are *adjacent* only if their
   ``occurred_at`` values are within ``window_seconds`` of each other.
 * **Join keys.** Two adjacent events join when they share **any** of: an
-  identical ``fingerprint``, an identical ``labels["commit_sha"]`` (the
+  identical ``fingerprint``, the same ``labels["commit_sha"]`` (the
   cross-provider join key of doc 03 §6.2 — stitches a Vercel deploy, a GitHub
-  push, and a Sentry ``release`` error spike into one incident), or an
+  push, and a Sentry ``release`` error spike into one incident; a short SHA
+  matches the full SHA it abbreviates), or an
   identical *non-null* ``service``. A null ``service`` never joins.
 * **Transitivity.** Grouping is transitive within the window: adjacency edges
   form a graph whose connected components are incidents (so A–B and B–C can
@@ -25,7 +26,7 @@ Grouping rules (per doc 01 §5, doc 03 §6.2):
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict
@@ -73,10 +74,29 @@ def _adjacent(a: CanonicalEvent, b: CanonicalEvent, window_seconds: float) -> bo
         return False
     if a.fingerprint == b.fingerprint:
         return True
-    a_commit = a.labels.get("commit_sha")
-    if a_commit is not None and a_commit == b.labels.get("commit_sha"):
+    if _same_commit(a.labels.get("commit_sha"), b.labels.get("commit_sha")):
         return True
     return a.service is not None and a.service == b.service
+
+
+#: Shortest abbreviated SHA treated as identifying a commit (git's default).
+_MIN_SHA_LEN = 7
+
+
+def _same_commit(a: str | None, b: str | None) -> bool:
+    """True iff two commit SHAs name the same commit.
+
+    Providers disagree on length — Vercel sends the full 40-char SHA, a Sentry
+    release often carries the 7-char short form — so a short SHA matches any full
+    SHA it prefixes. Below ``_MIN_SHA_LEN`` only an exact match counts.
+    """
+    if a is None or b is None:
+        return False
+    a, b = a.lower(), b.lower()
+    if a == b:
+        return True
+    short, full = sorted((a, b), key=len)
+    return len(short) >= _MIN_SHA_LEN and full.startswith(short)
 
 
 def _components(events: list[CanonicalEvent], window_seconds: float) -> list[list[int]]:
@@ -172,3 +192,64 @@ def correlate(
 
     clusters.sort(key=lambda group: _order_key(group[0]))
     return [_draft(group, new_incident_id()) for group in clusters]
+
+
+class Correlation(BaseModel):
+    """New events split into those joining incidents already open, and new incidents."""
+
+    model_config = ConfigDict(frozen=True)
+
+    attached: dict[str, list[CanonicalEvent]]  # incident_id → its newly arrived events
+    drafts: list[IncidentDraft]
+
+
+def correlate_with_open(
+    events: Iterable[CanonicalEvent],
+    open_incidents: Mapping[str, Sequence[CanonicalEvent]],
+    *,
+    window_seconds: float,
+    new_incident_id: Callable[[], str] = _default_incident_id,
+) -> Correlation:
+    """Correlate new events against still-open incidents before opening new ones.
+
+    Alerts keep arriving after an incident opens. :func:`correlate` alone would
+    turn each late batch into a fresh incident — a second page, and possibly a
+    second action. Here the open incidents' events take part in the same
+    adjacency graph (same join keys, same window, same tenant isolation), so a
+    new event that joins an open incident — directly or transitively through
+    other new events — is attached to it. Only clusters touching no open incident
+    become new drafts. If one cluster bridges several open incidents, the
+    earliest-opened one gets the events.
+    """
+    owner: dict[str, str] = {}  # event_id → open incident_id
+    first_seen: dict[str, tuple[datetime, str]] = {}
+    pool: dict[str, list[CanonicalEvent]] = {}
+    for incident_id, incident_events in open_incidents.items():
+        for e in incident_events:
+            owner[e.event_id] = incident_id
+            pool.setdefault(e.tenant_id, []).append(e)
+        if incident_events:
+            first_seen[incident_id] = min(_order_key(e) for e in incident_events)
+    for e in events:
+        if e.event_id not in owner:  # a redelivered event is already accounted for
+            pool.setdefault(e.tenant_id, []).append(e)
+
+    attached: dict[str, list[CanonicalEvent]] = {}
+    clusters: list[list[CanonicalEvent]] = []
+    for tenant_events in pool.values():
+        for component in _components(tenant_events, window_seconds):
+            members = [tenant_events[i] for i in component]
+            fresh = sorted((e for e in members if e.event_id not in owner), key=_order_key)
+            if not fresh:
+                continue
+            touched = {owner[e.event_id] for e in members if e.event_id in owner}
+            if touched:
+                target = min(touched, key=lambda inc: first_seen[inc])
+                attached.setdefault(target, []).extend(fresh)
+            else:
+                clusters.append(fresh)
+
+    clusters.sort(key=lambda group: _order_key(group[0]))
+    return Correlation(
+        attached=attached, drafts=[_draft(group, new_incident_id()) for group in clusters]
+    )

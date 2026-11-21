@@ -30,6 +30,19 @@ findings:
     status: no_signal
     summary: "No corroborating metric anomaly; request volume and latency remain within normal bands."
     self_confidence: 0.10
+observations:
+  - kind: log
+    summary: "3 isolated 522 responses over 4 minutes; no error spike"
+    observed_at: "2026-05-15T19:01:30Z"
+    raw_ref: "obj://redacted/log_522_0023"
+  - kind: alert
+    summary: "BetterStack probe from fra1 failed twice, other regions passing"
+    observed_at: "2026-05-15T19:01:00Z"
+    raw_ref: "obj://redacted/alert_probe_0023"
+  - kind: metric
+    summary: "request volume and p95 latency within normal bands"
+    observed_at: "2026-05-15T19:02:00Z"
+    raw_ref: "obj://redacted/met_traffic_0023"
 expected:
   root_cause_class: "uptime_flap.indeterminate"
   primary_service_kind: "edge"

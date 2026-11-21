@@ -44,6 +44,8 @@ from sentinel.orchestrator import (
     run_incident,
 )
 
+# fitted and validated, so T3 grants may act (the calibration gate has its own tests)
+_TRUSTED_CAL = Calibrator(temperature=1.0, version="cal.test", fitted_on=1000, holdout_ece=0.01)
 _T = datetime(2026, 6, 14, 12, 0, tzinfo=UTC)
 
 
@@ -148,7 +150,9 @@ class FakePlanner:
     def __init__(self, plan: RemediationPlan) -> None:
         self._plan = plan
 
-    async def draft(self, incident_id: str, hypothesis: Hypothesis) -> RemediationPlan:
+    async def draft(
+        self, incident_id: str, hypothesis: Hypothesis, events: Sequence[CanonicalEvent]
+    ) -> RemediationPlan:
         return self._plan
 
 
@@ -158,7 +162,7 @@ class RecordingExecutor:
         self.calls: list[RemediationPlan] = []
 
     async def execute(
-        self, plan: RemediationPlan, *, tenant_id: str, incident_id: str
+        self, plan: RemediationPlan, *, tenant_id: str, incident_id: str, action_id: str
     ) -> ActionResult:
         self.calls.append(plan)
         return self._result
@@ -188,8 +192,8 @@ def _run(
             commander=commander,
             planner=planner,
             executor=ex,
-            grant=_grant(grant_tier),
-            calibrator=Calibrator(temperature=1.0, version="cal.test"),
+            grants=[_grant(grant_tier)],
+            calibrator=_TRUSTED_CAL,
             clock=lambda: _T,
         )
     )
@@ -304,7 +308,7 @@ class _BrokerExecutor:
         self._router = router
 
     async def execute(
-        self, plan: RemediationPlan, *, tenant_id: str, incident_id: str
+        self, plan: RemediationPlan, *, tenant_id: str, incident_id: str, action_id: str
     ) -> ActionResult:
         broker = ToolBroker(tenant_id=tenant_id, incident_id=incident_id, router=self._router)
         result = await broker.call(

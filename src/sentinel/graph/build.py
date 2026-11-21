@@ -19,7 +19,8 @@ Control flow::
 
 The default checkpointer is an in-memory saver (offline + tests). The production
 swap is the Postgres checkpointer (doc 02 / doc 04 §9): pass it as ``checkpointer``
-and nothing else changes.
+and nothing else changes. A graph that accepts approvals must be given one
+explicitly (see :func:`build_incident_graph`).
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from sentinel.confidence import Calibrator
 from sentinel.contracts import AutonomyGrant
+from sentinel.escalation import GrantLookup, as_grant_lookup
 from sentinel.graph.nodes import (
     AuditSink,
     Node,
@@ -49,6 +51,7 @@ from sentinel.graph.nodes import (
 )
 from sentinel.graph.state import IncidentGraphState
 from sentinel.notify import Notifier
+from sentinel.orchestrator.ledger import ActionLedger, InMemoryActionLedger
 from sentinel.orchestrator.protocols import ActionExecutor, Commander, Planner, Specialist
 
 
@@ -89,7 +92,7 @@ def build_incident_graph(
     commander: Commander,
     planner: Planner,
     executor: ActionExecutor,
-    grant: AutonomyGrant,
+    grants: GrantLookup | Sequence[AutonomyGrant],
     calibrator: Calibrator,
     competing_margin: float = 0.15,
     clock: Callable[[], datetime] = _utcnow,
@@ -98,6 +101,9 @@ def build_incident_graph(
     cost_breaker_open: Callable[[str], bool] | None = None,
     approval_ttl: timedelta | None = timedelta(hours=1),
     audit: AuditSink | None = None,
+    ledger: ActionLedger | None = None,
+    approvers: Callable[[str, str], bool] | None = None,
+    require_calibrated_autonomy: bool = True,
 ) -> CompiledStateGraph[IncidentGraphState]:
     """Build and compile the durable incident graph wired with the given ports.
 
@@ -105,12 +111,36 @@ def build_incident_graph(
     (``tenant_id → open?``) forces T0 while a tenant is over budget (doc 07 §5).
     An approval arriving more than ``approval_ttl`` after it was requested is
     treated as a denial. ``audit`` records each decision, approval and action.
+
+    ``grants`` is either the tenants' grants or a live ``(tenant_id, action_type) →
+    grant`` lookup; each decision uses the grant for its own action type, and
+    ``act`` re-checks it. ``ledger`` makes execution at-most-once per action (the
+    in-memory default is not durable — pass a Postgres-backed one in production).
+    ``approvers`` (``tenant_id, approver → allowed?``) decides who may approve;
+    without it every approval is denied.
+
+    A T3 grant acts autonomously only if ``calibrator`` is trusted for autonomy
+    (fitted on enough labelled incidents, validated on held-out ones — see
+    :meth:`~sentinel.confidence.Calibrator.trusted_for_autonomy`); otherwise T3 is
+    treated as T2. ``require_calibrated_autonomy=False`` lifts that cap, for demos.
+
+    An incident waiting for approval lives only in the checkpointer, so a graph
+    that can accept approvals needs a durable one (the Postgres saver): with
+    ``approvers`` set, ``checkpointer`` must be passed explicitly — the implicit
+    in-memory default would lose every paused incident on restart. Passing an
+    ``InMemorySaver`` deliberately (tests, demos) is allowed.
     """
+    if approvers is not None and checkpointer is None:
+        raise ValueError(
+            "approvals need a durable checkpointer: pass checkpointer= explicitly "
+            "(e.g. the Postgres saver) when approvers are configured"
+        )
     deps = _Deps(
         commander=commander,
         planner=planner,
         executor=executor,
-        grant=grant,
+        grants=as_grant_lookup(grants),
+        ledger=ledger or InMemoryActionLedger(),
         calibrator=calibrator,
         competing_margin=competing_margin,
         clock=clock,
@@ -118,6 +148,10 @@ def build_incident_graph(
         cost_breaker_open=cost_breaker_open,
         approval_ttl=approval_ttl,
         audit=audit,
+        approvers=approvers,
+        autonomy_calibrated=(
+            not require_calibrated_autonomy or calibrator.trusted_for_autonomy()
+        ),
     )
 
     g: StateGraph[IncidentGraphState] = StateGraph(IncidentGraphState)
